@@ -1,0 +1,22 @@
+# ================================================================
+# YouTube канали для моніторингу — YouTube Agent #2b
+#
+# channel_id:          знайти на сторінці каналу → About → Share channel
+#                      або з URL: youtube.com/channel/UCxxxxxxxx
+# name:                зручна назва для Telegram повідомлень
+# max_videos_per_run:  скільки нових відео обробляти за один запуск (3 за замовч.)
+# focus:               тематичний фокус для Claude summary (опційно)
+#                      якщо не вказано — загальний AI/автоматизація фокус
+# ================================================================
+
+youtube_channels:
+  - channel_id: "UCVmRMJFQbTrFHuDnJDwFg3Q"   # прикладний (замінити на реальний)
+    name: "AI Jason"
+    max_videos_per_run: 2
+    focus: "практичні AI агенти для автоматизації бізнесу, конкретні інструменти та кейси"
+
+  # Шаблон для нового каналу:
+  # - channel_id: "UCxxxxxxxxxxxxxxxxxxxxxxxx"
+  #   name: "Назва каналу"
+  #   max_videos_per_run: 3
+  #   focus: "опційний фокус аналізу"
