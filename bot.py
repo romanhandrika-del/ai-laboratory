@@ -185,23 +185,11 @@ async def handle_yt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    import time
-    import requests as _requests
-
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не знайдено в .env")
 
-    # Скидаємо стару сесію і чекаємо поки старий інстанс завершиться
-    try:
-        _requests.get(
-            f"https://api.telegram.org/bot{token}/deleteWebhook",
-            params={"drop_pending_updates": "true"},
-            timeout=5,
-        )
-    except Exception:
-        pass
-    time.sleep(10)
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip()
 
     app = ApplicationBuilder().token(token).build()
 
@@ -210,8 +198,20 @@ def main() -> None:
     app.add_handler(CommandHandler("yt", handle_yt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 AI Laboratory Bot запущено")
-    app.run_polling(drop_pending_updates=True)
+    if webhook_url:
+        # Продакшн (Railway) — webhook режим, без конфліктів при деплої
+        port = int(os.getenv("PORT", "8080"))
+        logger.info("🤖 AI Laboratory Bot запущено (webhook: %s)", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=f"{webhook_url}/webhook",
+            drop_pending_updates=True,
+        )
+    else:
+        # Локальна розробка — polling
+        logger.info("🤖 AI Laboratory Bot запущено (polling)")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
