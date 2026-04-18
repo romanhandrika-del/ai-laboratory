@@ -1,0 +1,32 @@
+# ================================================================
+# Сайти для моніторингу — Web Parser Agent #2
+# Додавай нові сайти за шаблоном нижче.
+#
+# selectors:
+#   container:   CSS-селектор повторюваного блоку (якщо є картки/тарифи)
+#   title:       CSS-селектор назви елемента  ← обов'язково (ключ для diff)
+#   description: CSS-селектор опису           (опційно)
+#   price:       CSS-селектор ціни            (опційно)
+#   + будь-які інші поля за потреби
+#
+# key_field: поле для ідентифікації елемента (за замовчуванням "title")
+# ================================================================
+
+websites:
+  - url: https://sendpulse.ua/pricing
+    name: "SendPulse — тарифи"
+    key_field: "title"
+    selectors:
+      container: ".details-tariff"
+      title: ".details-tariff__title"
+      description: ".details-tariff__intro .mb-0:last-child"
+
+  # Шаблон для нового сайту:
+  # - url: https://example.com/services
+  #   name: "Назва сайту"
+  #   key_field: "title"
+  #   selectors:
+  #     container: ".service-card"
+  #     title: ".service-title"
+  #     description: ".service-desc"
+  #     price: ".service-price"
