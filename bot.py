@@ -185,9 +185,23 @@ async def handle_yt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
+    import time
+    import requests as _requests
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не знайдено в .env")
+
+    # Скидаємо стару сесію і чекаємо поки старий інстанс завершиться
+    try:
+        _requests.get(
+            f"https://api.telegram.org/bot{token}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+    time.sleep(10)
 
     app = ApplicationBuilder().token(token).build()
 
