@@ -3,6 +3,7 @@ AI Laboratory — Telegram Bot
 Agent #1: Sales Agent
 """
 
+import asyncio
 import os
 import logging
 from dotenv import load_dotenv
@@ -138,9 +139,49 @@ async def handle_reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Команда /reload_kb — оновлює Knowledge Base з Google Sheets."""
     chat_id = update.effective_chat.id
     if str(chat_id) != MANAGER_TELEGRAM_ID:
-        return  # тільки менеджер
+        return
     sales_agent.reload_kb()
     await update.message.reply_text("✅ Knowledge Base оновлена")
+
+
+async def handle_yt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Команда /yt <url> — аналізує YouTube відео та повертає ключові тези.
+
+    Доступна тільки менеджеру. Приклад:
+        /yt https://www.youtube.com/watch?v=VIDEO_ID
+    """
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        return
+
+    url = " ".join(context.args).strip() if context.args else ""
+    if not url:
+        await update.message.reply_text("❌ Вкажи URL відео:\n/yt https://youtube.com/watch?v=...")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Отримую транскрипцію...")
+
+    try:
+        from agents.youtube_agent.transcript import get_video_id, get_transcript
+        from agents.youtube_agent.summarizer import summarize, format_telegram_message
+
+        video_id = get_video_id(url)
+        transcript_data = await asyncio.to_thread(get_transcript, video_id)
+
+        await status_msg.edit_text("🧠 Аналізую через Claude...")
+
+        summary = await asyncio.to_thread(summarize, transcript_data["text"], url)
+        message = format_telegram_message(title=f"Відео {video_id}", url=url, summary=summary)
+
+        await status_msg.edit_text(message, parse_mode="HTML")
+        logger.info(f"[/yt] Оброблено відео {video_id}")
+
+    except ValueError as e:
+        await status_msg.edit_text(f"❌ {e}")
+    except Exception as e:
+        logger.error(f"[/yt] Помилка: {e}")
+        await status_msg.edit_text(f"❌ Помилка при обробці відео: {e}")
 
 
 def main() -> None:
@@ -152,6 +193,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
+    app.add_handler(CommandHandler("yt", handle_yt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 AI Laboratory Bot запущено")
