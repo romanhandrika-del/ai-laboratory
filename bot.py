@@ -412,16 +412,35 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     message = body.get("message", "").strip()
     source = body.get("source", "instagram")
     name = body.get("name", "Клієнт")
+    file_url = body.get("file_url")
+    file_type = body.get("file_type")
 
-    if not user_id or not message:
+    if not user_id:
         return web.json_response({"reply": ""})
 
     try:
-        reply = await asyncio.to_thread(
-            ig_handle_message, user_id, message, source, name, sales_agent
-        )
+        # Якщо прийшло фото/PDF — обробляємо через Claude Vision + Google OCR
+        if file_url:
+            from agents.instagram.file_handler import handle_file_url
+            from agents.instagram.instagram_agent import _history, MAX_HISTORY
+            context = _history.get(user_id, [])
+            reply = await handle_file_url(
+                file_url, file_type, context, sales_agent.system_prompt
+            )
+            # Зберігаємо в history
+            label = "[photo]" if file_type != "pdf" else "[pdf]"
+            ctx_msg = f"{label} {message}".strip() if message else label
+            context.append({"role": "user", "content": ctx_msg})
+            context.append({"role": "assistant", "content": reply})
+            _history[user_id] = context[-MAX_HISTORY:]
+        else:
+            if not message:
+                return web.json_response({"reply": ""})
+            reply = await asyncio.to_thread(
+                ig_handle_message, user_id, message, source, name, sales_agent
+            )
     except Exception as e:
-        logger.error("Instagram handle_message error: %s", e)
+        logger.error("Instagram handle error: %s", e)
         return web.json_response({"reply": "Вибачте, виникла помилка. Спробуйте ще раз."})
 
     return web.json_response({"reply": reply})
