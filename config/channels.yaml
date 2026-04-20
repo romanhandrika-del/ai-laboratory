@@ -10,10 +10,10 @@
 # ================================================================
 
 youtube_channels:
-  - channel_id: "UCVmRMJFQbTrFHuDnJDwFg3Q"   # прикладний (замінити на реальний)
-    name: "AI Jason"
-    max_videos_per_run: 2
-    focus: "практичні AI агенти для автоматизації бізнесу, конкретні інструменти та кейси"
+  - channel_id: "UCSHZKyawb77ixDdsGog4iWA"   # Lex Fridman Podcast — тест
+    name: "Lex Fridman"
+    max_videos_per_run: 1
+    focus: "AI, технології, наука — нові ідеї та інсайти для бізнесу та розвитку"
 
   # Шаблон для нового каналу:
   # - channel_id: "UCxxxxxxxxxxxxxxxxxxxxxxxx"

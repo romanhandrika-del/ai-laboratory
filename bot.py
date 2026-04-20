@@ -19,6 +19,9 @@ from core.logger import get_logger
 from core.message import AgentMessage
 from core.brain_archive import GoogleSheetsBrainArchive, make_brain_record
 from agents.sales.sales_agent import create_sales_agent
+from agents.website_audit.website_audit_agent import WebsiteAuditAgent
+from agents.website_fix.website_fix_agent import WebsiteFixAgent
+from agents.web_design.web_design_agent import WebDesignAgent
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -144,6 +147,191 @@ async def handle_reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("✅ Knowledge Base оновлена")
 
 
+async def handle_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /audit <url> — запускає Website Audit Agent."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Використання: /audit https://example.com")
+        return
+
+    url = args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    await update.message.reply_text(f"⏳ Аналізую сайт: {url}\nЦе займе ~30-90 секунд...")
+
+    agent = WebsiteAuditAgent(client_id="default")
+    result = await agent.audit(url)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка аудиту:\n{result['error']}")
+        return
+
+    await update.message.reply_html(result["summary_text"])
+
+    report_path = result.get("report_md_path")
+    if report_path:
+        from pathlib import Path
+        p = Path(report_path)
+        if p.exists():
+            with open(p, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=p.name,
+                    caption="📋 Повний звіт аудиту",
+                )
+
+
+
+async def handle_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /push <url> — заливає fix-пакет на сервер через FTP."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Використання: /push https://example.com")
+        return
+
+    url = args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    await update.message.reply_text(f"📤 Заливаю fix-пакет на сервер: {url}...")
+
+    agent = WebsiteFixAgent(client_id="default")
+    result = await agent.push(url)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка:\n{result['error']}")
+        return
+
+    await update.message.reply_html(result["summary_text"])
+
+
+async def handle_rollback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /rollback <url> — відновлює попередню версію mu-plugin з backup."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Використання: /rollback https://example.com")
+        return
+
+    url = args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    await update.message.reply_text(f"↩️ Виконую rollback для: {url}...")
+
+    agent = WebsiteFixAgent(client_id="default")
+    result = await agent.rollback(url)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка:\n{result['error']}")
+        return
+
+    await update.message.reply_html(result["summary_text"])
+
+
+async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /fix <url> — генерує пакет SEO-фіксів."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Використання: /fix https://example.com")
+        return
+
+    url = args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    await update.message.reply_text(f"⏳ Генерую SEO-фікси для: {url}\nЦе займе ~30-60 секунд...")
+
+    agent = WebsiteFixAgent(client_id="default")
+    result = await agent.fix(url)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка:\n{result['error']}")
+        return
+
+    await update.message.reply_html(result["summary_text"])
+
+    fix_path = result.get("fix_md_path")
+    if fix_path:
+        from pathlib import Path
+        p = Path(fix_path)
+        if p.exists():
+            with open(p, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=p.name,
+                    caption="🔧 Пакет фіксів (File/Selector/Search/Replace)",
+                )
+
+
+async def handle_design(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /design <url> або /design brief: <текст> — генерує дизайн-пакет."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Використання:\n"
+            "  /design https://example.com\n"
+            "  /design brief: лендінг для кав'ярні у Львові"
+        )
+        return
+
+    input_text = " ".join(args).strip()
+    if not input_text.startswith(("http://", "https://", "brief:")):
+        input_text = "https://" + input_text
+
+    mode_label = "сайту" if input_text.startswith("http") else "брифу"
+    await update.message.reply_text(f"⏳ Генерую дизайн-пакет для {mode_label}...\nЦе займе ~60-120 секунд.")
+
+    agent = WebDesignAgent(client_id="default")
+    result = await agent.design(input_text)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка:\n{result['error']}")
+        return
+
+    await update.message.reply_html(result["summary_text"])
+
+    for file_key, caption in [("brief_path", "📋 Дизайн-бриф"), ("mockup_path", "🎨 HTML/CSS макет")]:
+        file_path = result.get(file_key)
+        if file_path:
+            from pathlib import Path
+            p = Path(file_path)
+            if p.exists():
+                with open(p, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=p.name,
+                        caption=caption,
+                    )
+
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -156,6 +344,11 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
+    app.add_handler(CommandHandler("audit", handle_audit))
+    app.add_handler(CommandHandler("fix", handle_fix))
+    app.add_handler(CommandHandler("push", handle_push))
+    app.add_handler(CommandHandler("rollback", handle_rollback))
+    app.add_handler(CommandHandler("design", handle_design))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if webhook_url:
