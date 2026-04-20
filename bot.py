@@ -25,7 +25,7 @@ from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
-from agents.instagram.instagram_agent import parse_dm_events, handle_dm
+from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -399,18 +399,32 @@ async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _ig_webhook_receive(request: web.Request) -> web.Response:
-    """POST /instagram/webhook — вхідні DM від SendPulse."""
+    """POST /instagram/webhook — вхідні DM від Sendrules."""
+    secret = request.headers.get("X-Webhook-Secret")
+    if not verify_secret(secret):
+        return web.Response(status=403)
     try:
         body = await request.json()
     except Exception:
         return web.Response(status=400)
-    events = parse_dm_events(body)
-    for event in events:
-        try:
-            await asyncio.to_thread(handle_dm, event, sales_agent, _ig_history)
-        except Exception as e:
-            logger.error("Instagram handle_dm error: %s", e)
-    return web.Response(text="OK")
+
+    user_id = body.get("user_id", "")
+    message = body.get("message", "").strip()
+    source = body.get("source", "instagram")
+    name = body.get("name", "Клієнт")
+
+    if not user_id or not message:
+        return web.json_response({"reply": ""})
+
+    try:
+        reply = await asyncio.to_thread(
+            ig_handle_message, user_id, message, source, name, sales_agent
+        )
+    except Exception as e:
+        logger.error("Instagram handle_message error: %s", e)
+        return web.json_response({"reply": "Вибачте, виникла помилка. Спробуйте ще раз."})
+
+    return web.json_response({"reply": reply})
 
 
 async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
