@@ -4,9 +4,11 @@ Agent #1: Sales Agent
 """
 
 import asyncio
+import json
 import os
 import logging
 from dotenv import load_dotenv
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,6 +25,9 @@ from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
+from agents.instagram.instagram_agent import (
+    get_verify_token, verify_signature, parse_dm_events, handle_dm,
+)
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -47,6 +52,9 @@ MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID")
 # Conversation history: {chat_id: [messages]}
 _history: dict[int, list[dict]] = {}
 MAX_HISTORY = 8
+
+# Instagram conversation history: {"ig_<sender_id>": [messages]}
+_ig_history: dict[str, list[dict]] = {}
 
 
 def _get_history(chat_id: int) -> list[dict]:
@@ -392,40 +400,100 @@ async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_html(text)
 
 
+async def _ig_webhook_verify(request: web.Request) -> web.Response:
+    """GET /instagram/webhook — верифікація від Meta."""
+    mode = request.rel_url.query.get("hub.mode")
+    token = request.rel_url.query.get("hub.verify_token")
+    challenge = request.rel_url.query.get("hub.challenge")
+    if mode == "subscribe" and token == get_verify_token():
+        logger.info("Instagram webhook верифіковано")
+        return web.Response(text=challenge)
+    return web.Response(status=403)
+
+
+async def _ig_webhook_receive(request: web.Request) -> web.Response:
+    """POST /instagram/webhook — вхідні DM від Meta."""
+    payload = await request.read()
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_signature(payload, sig):
+        logger.warning("Instagram webhook: невалідний підпис")
+        return web.Response(status=403)
+    try:
+        body = json.loads(payload)
+    except Exception:
+        return web.Response(status=400)
+    events = parse_dm_events(body)
+    for event in events:
+        try:
+            await asyncio.to_thread(handle_dm, event, sales_agent, _ig_history)
+        except Exception as e:
+            logger.error("Instagram handle_dm error: %s", e)
+    return web.Response(text="EVENT_RECEIVED")
+
+
+async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
+    """POST /webhook — вхідні оновлення від Telegram."""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+    except Exception as e:
+        logger.error("Telegram webhook error: %s", e)
+    return web.Response(text="OK")
+
+
+async def _run_aiohttp(tg_app, port: int) -> None:
+    aio_app = web.Application()
+    aio_app.router.add_get("/instagram/webhook", _ig_webhook_verify)
+    aio_app.router.add_post("/instagram/webhook", _ig_webhook_receive)
+    aio_app.router.add_post("/webhook", lambda r: _tg_webhook_receive(r, tg_app))
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("aiohttp сервер запущено на порту %d", port)
+    await asyncio.Event().wait()
+
+
+def _build_tg_app(token: str):
+    tg_app = ApplicationBuilder().token(token).build()
+    tg_app.add_handler(CommandHandler("start", handle_start))
+    tg_app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
+    tg_app.add_handler(CommandHandler("review", handle_review))
+    tg_app.add_handler(CommandHandler("audit", handle_audit))
+    tg_app.add_handler(CommandHandler("fix", handle_fix))
+    tg_app.add_handler(CommandHandler("push", handle_push))
+    tg_app.add_handler(CommandHandler("rollback", handle_rollback))
+    tg_app.add_handler(CommandHandler("design", handle_design))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    return tg_app
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не знайдено в .env")
 
     webhook_url = os.getenv("WEBHOOK_URL", "").strip()
-
-    app = ApplicationBuilder().token(token).build()
-
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
-    app.add_handler(CommandHandler("review", handle_review))
-    app.add_handler(CommandHandler("audit", handle_audit))
-    app.add_handler(CommandHandler("fix", handle_fix))
-    app.add_handler(CommandHandler("push", handle_push))
-    app.add_handler(CommandHandler("rollback", handle_rollback))
-    app.add_handler(CommandHandler("design", handle_design))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    tg_app = _build_tg_app(token)
 
     if webhook_url:
-        # Продакшн (Railway) — webhook режим, без конфліктів при деплої
         port = int(os.getenv("PORT", "8080"))
-        logger.info("🤖 AI Laboratory Bot запущено (webhook: %s)", webhook_url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="/webhook",
-            webhook_url=f"{webhook_url}/webhook",
-            drop_pending_updates=True,
-        )
+        logger.info("🤖 AI Laboratory Bot запущено (aiohttp: %s)", webhook_url)
+
+        async def _start():
+            await tg_app.initialize()
+            await tg_app.start()
+            await tg_app.bot.set_webhook(
+                url=f"{webhook_url}/webhook",
+                drop_pending_updates=True,
+            )
+            await _run_aiohttp(tg_app, port)
+
+        asyncio.run(_start())
     else:
-        # Локальна розробка — polling
         logger.info("🤖 AI Laboratory Bot запущено (polling)")
-        app.run_polling(drop_pending_updates=True)
+        tg_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
