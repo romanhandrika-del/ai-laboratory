@@ -18,6 +18,7 @@ from telegram.ext import (
 from core.logger import get_logger
 from core.message import AgentMessage
 from core.brain_archive import GoogleSheetsBrainArchive, make_brain_record
+from core.conversation_storage import init_db as init_conv_db, save_conversation, get_review, get_stats
 from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
@@ -25,6 +26,8 @@ from agents.web_design.web_design_agent import WebDesignAgent
 
 load_dotenv()
 logger = get_logger(__name__)
+
+init_conv_db()
 
 # Ініціалізація агента
 sales_agent = create_sales_agent()
@@ -105,6 +108,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Зберігаємо в history
     _add_to_history(chat_id, "user", user_text)
     _add_to_history(chat_id, "assistant", result.content)
+
+    # Логуємо розмову в SQLite
+    save_conversation(
+        client_id=sales_agent.client_id,
+        chat_id=chat_id,
+        user_msg=user_text,
+        bot_reply=result.content,
+        confidence=result.confidence,
+        needs_human=result.needs_human,
+        model_used=result.model_used,
+        cost_usd=result.cost_usd,
+    )
 
     # Відповідаємо клієнту
     await update.message.reply_text(result.content)
@@ -333,6 +348,50 @@ async def handle_design(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     )
 
 
+async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /review [low] — показує останні розмови Sales Agent."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    only_low = "low" in (context.args or [])
+    stats = get_stats(sales_agent.client_id)
+    rows = get_review(sales_agent.client_id, limit=10, only_low=only_low)
+
+    header = (
+        f"📊 <b>Sales Agent — огляд розмов</b>\n"
+        f"Всього: {stats.get('total', 0)} | "
+        f"Avg confidence: {stats.get('avg_confidence', 0)} | "
+        f"Ескалацій: {stats.get('escalations', 0)} | "
+        f"Витрати: ${stats.get('total_cost', 0)}\n"
+    )
+    if only_low:
+        header += "⚠️ <i>Тільки низька впевненість / ескалації</i>\n"
+    header += "─" * 30 + "\n"
+
+    if not rows:
+        await update.message.reply_html(header + "Розмов поки немає.")
+        return
+
+    lines = [header]
+    for r in rows:
+        flag = "🔴" if r["needs_human"] else ("🟡" if r["confidence"] < 0.75 else "🟢")
+        ts = r["created_at"][:16].replace("T", " ")
+        lines.append(
+            f"{flag} <b>{ts}</b> | conf: {r['confidence']:.2f}\n"
+            f"👤 {r['user_msg'][:80]}\n"
+            f"🤖 {r['bot_reply'][:120]}\n"
+        )
+
+    text = "\n".join(lines)
+    # Telegram обмежує ~4096 символів
+    if len(text) > 4000:
+        text = text[:3950] + "\n<i>...обрізано</i>"
+
+    await update.message.reply_html(text)
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -344,6 +403,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
+    app.add_handler(CommandHandler("review", handle_review))
     app.add_handler(CommandHandler("audit", handle_audit))
     app.add_handler(CommandHandler("fix", handle_fix))
     app.add_handler(CommandHandler("push", handle_push))
