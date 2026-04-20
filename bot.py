@@ -25,9 +25,7 @@ from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
-from agents.instagram.instagram_agent import (
-    get_verify_token, verify_signature, parse_dm_events, handle_dm,
-)
+from agents.instagram.instagram_agent import parse_dm_events, handle_dm
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -400,26 +398,10 @@ async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_html(text)
 
 
-async def _ig_webhook_verify(request: web.Request) -> web.Response:
-    """GET /instagram/webhook — верифікація від Meta."""
-    mode = request.rel_url.query.get("hub.mode")
-    token = request.rel_url.query.get("hub.verify_token")
-    challenge = request.rel_url.query.get("hub.challenge")
-    if mode == "subscribe" and token == get_verify_token():
-        logger.info("Instagram webhook верифіковано")
-        return web.Response(text=challenge)
-    return web.Response(status=403)
-
-
 async def _ig_webhook_receive(request: web.Request) -> web.Response:
-    """POST /instagram/webhook — вхідні DM від Meta."""
-    payload = await request.read()
-    sig = request.headers.get("X-Hub-Signature-256", "")
-    if not verify_signature(payload, sig):
-        logger.warning("Instagram webhook: невалідний підпис")
-        return web.Response(status=403)
+    """POST /instagram/webhook — вхідні DM від SendPulse."""
     try:
-        body = json.loads(payload)
+        body = await request.json()
     except Exception:
         return web.Response(status=400)
     events = parse_dm_events(body)
@@ -428,7 +410,7 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
             await asyncio.to_thread(handle_dm, event, sales_agent, _ig_history)
         except Exception as e:
             logger.error("Instagram handle_dm error: %s", e)
-    return web.Response(text="EVENT_RECEIVED")
+    return web.Response(text="OK")
 
 
 async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
@@ -444,7 +426,6 @@ async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
 
 async def _run_aiohttp(tg_app, port: int) -> None:
     aio_app = web.Application()
-    aio_app.router.add_get("/instagram/webhook", _ig_webhook_verify)
     aio_app.router.add_post("/instagram/webhook", _ig_webhook_receive)
     aio_app.router.add_post("/webhook", lambda r: _tg_webhook_receive(r, tg_app))
     runner = web.AppRunner(aio_app)

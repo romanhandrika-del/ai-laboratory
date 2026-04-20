@@ -1,13 +1,12 @@
 """
-Instagram DM Agent — обробляє вхідні Direct Messages через Meta Webhooks.
+Instagram DM Agent — інтеграція через SendPulse chatbot webhooks.
 
-Отримує DM → передає Sales Agent → відповідає через Graph API → логує у conversations.db.
-Env: INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_VERIFY_TOKEN
+Флоу: SendPulse webhook → parse → Sales Agent → SendPulse API reply → conversations.db
+Env: SENDPULSE_CLIENT_ID, SENDPULSE_CLIENT_SECRET
 """
 
-import hashlib
-import hmac
 import os
+import time
 
 import httpx
 
@@ -17,72 +16,92 @@ from core.conversation_storage import save_conversation
 
 logger = get_logger(__name__)
 
-_GRAPH_URL = "https://graph.facebook.com/v19.0"
+_SP_BASE = "https://api.sendpulse.com"
+_TOKEN_URL = f"{_SP_BASE}/oauth/access_token"
+_SEND_URL = f"{_SP_BASE}/instagram/contacts/send"
+
+# Кеш токену: (access_token, expires_at)
+_token_cache: tuple[str, float] = ("", 0.0)
 
 
-def get_verify_token() -> str:
-    return os.getenv("INSTAGRAM_VERIFY_TOKEN", "")
-
-
-def get_access_token() -> str:
-    return os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
-
-
-def verify_signature(payload: bytes, signature_header: str) -> bool:
-    """Перевіряє X-Hub-Signature-256 від Meta."""
-    app_secret = os.getenv("INSTAGRAM_APP_SECRET", "")
-    if not app_secret:
-        return True  # якщо секрет не заданий — пропускаємо перевірку
-    expected = "sha256=" + hmac.new(
-        app_secret.encode(), payload, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+def _get_access_token() -> str:
+    global _token_cache
+    token, expires_at = _token_cache
+    if token and time.time() < expires_at - 60:
+        return token
+    resp = httpx.post(
+        _TOKEN_URL,
+        json={
+            "grant_type": "client_credentials",
+            "client_id": os.getenv("SENDPULSE_CLIENT_ID", ""),
+            "client_secret": os.getenv("SENDPULSE_CLIENT_SECRET", ""),
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    token = data["access_token"]
+    expires_at = time.time() + int(data.get("expires_in", 3600))
+    _token_cache = (token, expires_at)
+    return token
 
 
 def parse_dm_events(body: dict) -> list[dict]:
     """
-    Витягує DM-події з webhook payload.
-    Повертає список: [{sender_id, recipient_id, text, mid}]
+    Парсить SendPulse webhook payload.
+    Повертає список: [{contact_id, sender_id, text}]
+
+    SendPulse надсилає або один об'єкт або список.
     """
     events = []
-    for entry in body.get("entry", []):
-        for msg_event in entry.get("messaging", []):
-            msg = msg_event.get("message", {})
-            text = msg.get("text", "").strip()
-            if not text or msg.get("is_echo"):
-                continue
+    items = body if isinstance(body, list) else [body]
+    for item in items:
+        if item.get("service") != "instagram":
+            continue
+        if item.get("title") != "incoming_message":
+            continue
+        info = item.get("info", {})
+        msg_text = (
+            info.get("message", {}).get("text", "")
+            or info.get("text", "")
+        ).strip()
+        contact_id = (
+            info.get("contact", {}).get("id", "")
+            or info.get("contact_id", "")
+        )
+        sender_id = contact_id  # для логування
+        if msg_text and contact_id:
             events.append({
-                "sender_id": msg_event["sender"]["id"],
-                "recipient_id": msg_event["recipient"]["id"],
-                "text": text,
-                "mid": msg.get("mid", ""),
+                "contact_id": contact_id,
+                "sender_id": sender_id,
+                "text": msg_text,
             })
     return events
 
 
-def send_reply(recipient_id: str, text: str) -> bool:
-    """Надсилає відповідь через Instagram Graph API."""
-    token = get_access_token()
-    if not token:
-        logger.error("INSTAGRAM_ACCESS_TOKEN не задано")
+def send_reply(contact_id: str, text: str) -> bool:
+    """Надсилає відповідь через SendPulse Instagram API."""
+    try:
+        token = _get_access_token()
+    except Exception as e:
+        logger.error("SendPulse token error: %s", e)
         return False
     try:
         resp = httpx.post(
-            f"{_GRAPH_URL}/me/messages",
-            params={"access_token": token},
+            _SEND_URL,
+            headers={"Authorization": f"Bearer {token}"},
             json={
-                "recipient": {"id": recipient_id},
-                "message": {"text": text},
-                "messaging_type": "RESPONSE",
+                "contact_id": contact_id,
+                "messages": [{"type": "text", "message": {"text": text}}],
             },
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.error("Instagram send_reply error: %s", resp.text)
+            logger.error("SendPulse send_reply error %d: %s", resp.status_code, resp.text)
             return False
         return True
     except Exception as e:
-        logger.error("Instagram send_reply exception: %s", e)
+        logger.error("SendPulse send_reply exception: %s", e)
         return False
 
 
@@ -91,39 +110,34 @@ def handle_dm(event: dict, sales_agent, history_store: dict) -> None:
     Обробляє одну DM-подію:
     1. Формує контекст розмови
     2. Запускає Sales Agent
-    3. Відповідає через Graph API
+    3. Відповідає через SendPulse API
     4. Зберігає у conversations.db
     """
-    sender_id = event["sender_id"]
+    contact_id = event["contact_id"]
     user_text = event["text"]
 
-    # Контекст розмови (in-memory, аналогічно Telegram)
-    ctx_key = f"ig_{sender_id}"
+    ctx_key = f"ig_{contact_id}"
     context = history_store.get(ctx_key, [])
 
     message = AgentMessage(
         content=user_text,
         client_id=sales_agent.client_id,
         context=context,
-        metadata={"source": "instagram", "sender_id": sender_id},
+        metadata={"source": "instagram", "contact_id": contact_id},
     )
 
     result = sales_agent.run(message)
 
-    # Оновлюємо контекст
-    context = context + [
+    history_store[ctx_key] = (context + [
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": result.content},
-    ]
-    history_store[ctx_key] = context[-8:]  # sliding window 8
+    ])[-8:]
 
-    # Відправляємо відповідь
-    send_reply(sender_id, result.content)
+    send_reply(contact_id, result.content)
 
-    # Логуємо
     save_conversation(
         client_id=sales_agent.client_id,
-        chat_id=hash(sender_id) & 0x7FFFFFFF,  # int для сумісності зі схемою
+        chat_id=hash(contact_id) & 0x7FFFFFFF,
         user_msg=user_text,
         bot_reply=result.content,
         confidence=result.confidence,
@@ -133,6 +147,6 @@ def handle_dm(event: dict, sales_agent, history_store: dict) -> None:
     )
 
     logger.info(
-        "Instagram DM handled: sender=%s conf=%.2f needs_human=%s",
-        sender_id, result.confidence, result.needs_human,
+        "Instagram DM [SendPulse]: contact=%s conf=%.2f needs_human=%s",
+        contact_id, result.confidence, result.needs_human,
     )
