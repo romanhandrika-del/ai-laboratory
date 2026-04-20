@@ -140,6 +140,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _notify_manager(context, chat_id, user_text, result.content)
 
     # Логуємо в Brain Archive
+
     if brain_archive:
         try:
             record = make_brain_record(
@@ -151,6 +152,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             brain_archive.write(record)
         except Exception as e:
             logger.error(f"Brain Archive помилка: {e}")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Голосові повідомлення Telegram → Whisper → Sales Agent."""
+    chat_id = update.effective_chat.id
+    voice = update.message.voice
+
+    try:
+        tg_file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await tg_file.download_as_bytearray()
+    except Exception as e:
+        logger.error("Помилка завантаження голосового: %s", e)
+        await update.message.reply_text("Не вдалося отримати голосове. Спробуйте текстом 🙂")
+        return
+
+    from agents.instagram.speech import transcribe_audio
+    user_text = await transcribe_audio(bytes(audio_bytes), "audio/ogg")
+
+    if not user_text:
+        await update.message.reply_text(
+            "Не вдалося розпізнати голосове 🙂 Напишіть текстом — відповімо одразу."
+        )
+        return
+
+    logger.info("[chat=%d] Голосове розпізнано: %s", chat_id, user_text[:80])
+
+    result = sales_agent.run(AgentMessage(
+        content=user_text,
+        client_id=sales_agent.client_id,
+        context=_get_history(chat_id),
+        metadata={"chat_id": chat_id, "source": "telegram_voice"},
+    ))
+
+    _add_to_history(chat_id, "user", user_text)
+    _add_to_history(chat_id, "assistant", result.content)
+
+    save_conversation(
+        client_id=sales_agent.client_id,
+        chat_id=chat_id,
+        user_msg=f"[voice] {user_text}",
+        bot_reply=result.content,
+        confidence=result.confidence,
+        needs_human=result.needs_human,
+        model_used=result.model_used,
+        cost_usd=result.cost_usd,
+    )
+
+    await update.message.reply_text(result.content)
+
+    if result.needs_human:
+        await _notify_manager(context, chat_id, user_text, result.content)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -354,6 +406,49 @@ async def handle_design(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     )
 
 
+async def handle_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /train [low] — аналізує діалоги і пише пропозиції в Google Sheets."""
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    only_low = "low" in (context.args or [])
+    await update.message.reply_text("⏳ Аналізую діалоги...")
+
+    from agents.sales.trainer import run_training
+    result = await asyncio.to_thread(
+        run_training, sales_agent.client_id, 30, only_low
+    )
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Помилка тренування:\n{result['error']}")
+        return
+
+    suggestions = result.get("suggestions", [])
+    written = result.get("written", 0)
+
+    if not suggestions:
+        await update.message.reply_text(result.get("msg", "✅ Все добре — пропозицій немає."))
+        return
+
+    lines = [f"🧠 <b>Тренування завершено</b>\nЗаписано у Sheets: {written} пропозицій\n"]
+    for i, s in enumerate(suggestions[:8], 1):
+        prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
+        lines.append(
+            f"{prio} <b>{s.get('type', '')} — {s.get('priority', '')}</b>\n"
+            f"Проблема: {s.get('problem', '')}\n"
+            f"Пропозиція: {s.get('suggestion', '')}\n"
+        )
+    if len(suggestions) > 8:
+        lines.append(f"<i>...та ще {len(suggestions) - 8} пропозицій у Sheets</i>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n<i>...обрізано</i>"
+    await update.message.reply_html(text)
+
+
 async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /review [low] — показує останні розмови Sales Agent."""
     chat_id = update.effective_chat.id
@@ -415,6 +510,10 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     file_url = body.get("file_url")
     file_type = body.get("file_type")
 
+    # Логуємо сирий payload для діагностики типів файлів
+    logger.info("IG webhook payload: user=%s file_url=%s file_type=%s message=%s",
+                user_id, file_url, file_type, message[:50] if message else "")
+
     if not user_id:
         return web.json_response({"reply": ""})
 
@@ -428,11 +527,28 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
                 file_url, file_type, context, sales_agent.system_prompt
             )
             # Зберігаємо в history
-            label = "[photo]" if file_type != "pdf" else "[pdf]"
+            if file_type in ("audio", "voice"):
+                label = "[voice]"
+            elif file_type == "pdf":
+                label = "[pdf]"
+            else:
+                label = "[photo]"
             ctx_msg = f"{label} {message}".strip() if message else label
             context.append({"role": "user", "content": ctx_msg})
             context.append({"role": "assistant", "content": reply})
             _history[user_id] = context[-MAX_HISTORY:]
+            # Логуємо в SQLite
+            needs_human = "[NOTIFY_MANAGER]" in reply
+            save_conversation(
+                client_id=sales_agent.client_id,
+                chat_id=hash(user_id) & 0x7FFFFFFF,
+                user_msg=ctx_msg,
+                bot_reply=reply,
+                confidence=0.9,
+                needs_human=needs_human,
+                model_used="claude-sonnet-4-6",
+                cost_usd=0.0,
+            )
         else:
             if not message:
                 return web.json_response({"reply": ""})
@@ -479,6 +595,8 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("push", handle_push))
     tg_app.add_handler(CommandHandler("rollback", handle_rollback))
     tg_app.add_handler(CommandHandler("design", handle_design))
+    tg_app.add_handler(CommandHandler("train", handle_train))
+    tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return tg_app
 

@@ -182,13 +182,38 @@ async def handle_pdf_with_addon(pdf_bytes: bytes, conversation_history: list, sy
     return await handle_pdf_bytes(pdf_bytes, conversation_history, combined)
 
 
+AUDIO_EXTENSIONS = {".ogg", ".opus", ".mp3", ".m4a", ".mp4", ".aac", ".wav"}
+AUDIO_MIME_TYPES = {"audio/ogg", "audio/mpeg", "audio/mp4", "audio/aac", "audio/wav", "audio/opus"}
+
+
+def _is_audio(file_url: str, file_type: str | None) -> tuple[bool, str]:
+    """Повертає (is_audio, mime_hint)."""
+    # file_type від SendPulse: "audio", "voice", "audio_message"
+    if file_type in ("audio", "voice", "audio_message"):
+        return True, "audio/ogg"
+    url_lower = file_url.lower().split("?")[0]
+    for ext in AUDIO_EXTENSIONS:
+        if url_lower.endswith(ext):
+            mime = "audio/ogg" if ext in (".ogg", ".opus") else f"audio/{ext.lstrip('.')}"
+            return True, mime
+    # Ключові слова в URL (SendPulse може мати /audio/ або /voice/ в шляху)
+    if any(kw in url_lower for kw in ("/audio/", "/voice/", "/sound/")):
+        return True, "audio/ogg"
+    return False, ""
+
+
 async def handle_file_url(file_url: str, file_type: str | None, conversation_history: list, system_prompt: str = "") -> str:
     """
     Основна точка входу для webhook (Instagram/Facebook).
-    file_type: 'image', 'pdf' або None (автовизначення)
+    file_type: 'image', 'pdf', 'audio', 'voice' або None (автовизначення)
     """
     try:
         file_bytes = await _download_file(file_url)
+
+        # Голосове повідомлення → транскрипція → Sales Agent
+        is_audio, mime_hint = _is_audio(file_url, file_type)
+        if is_audio:
+            return await handle_audio_bytes(file_bytes, mime_hint, conversation_history, system_prompt)
 
         media_type = _detect_media_type(file_url) if file_type != "pdf" else "application/pdf"
 
@@ -203,3 +228,36 @@ async def handle_file_url(file_url: str, file_type: str | None, conversation_his
     except Exception as e:
         logger.error(f"Помилка обробки файлу: {e}")
         return "Помилка при обробці файлу. Спробуйте надіслати текстом або іншим форматом."
+
+
+async def handle_audio_bytes(audio_bytes: bytes, mime_hint: str, conversation_history: list, system_prompt: str) -> str:
+    """Транскрибує голосове через Google Speech і передає Sales Agent."""
+    from agents.instagram.speech import transcribe_audio
+    from core.message import AgentMessage
+
+    text = await transcribe_audio(audio_bytes, mime_hint)
+
+    if not text:
+        return "Не вдалося розпізнати голосове повідомлення 🙂 Напишіть текстом — відповімо одразу."
+
+    logger.info("Голосове розпізнано: %s", text[:80])
+
+    # Обробляємо розпізнаний текст як звичайне повідомлення через Claude
+    messages = conversation_history.copy()
+    messages.append({"role": "user", "content": f"[Голосове повідомлення]: {text}"})
+
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                system=system_prompt,
+                messages=messages,
+            )
+            return response.content[0].text
+        except APIStatusError as e:
+            if e.status_code == 529 and attempt < 2:
+                await asyncio.sleep(3)
+                continue
+            raise
+    return "Сервіс тимчасово перевантажений. Спробуйте через хвилину."
