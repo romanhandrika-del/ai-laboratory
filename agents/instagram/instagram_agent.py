@@ -41,7 +41,10 @@ def handle_message(
     if user_id not in _history:
         if len(_history) >= 1000:
             del _history[next(iter(_history))]
-        _history[user_id] = []
+        # Відновлюємо контекст з БД після рестарту Railway
+        chat_id = hash(user_id) & 0x7FFFFFFF
+        from core.conversation_storage import load_history
+        _history[user_id] = load_history(sales_agent.client_id, chat_id, limit=10)
 
     context = _history[user_id]
     context.append({"role": "user", "content": message})

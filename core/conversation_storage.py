@@ -168,6 +168,40 @@ def save_conversation(
             )
 
 
+def load_history(client_id: str, chat_id: int, limit: int = 10) -> list[dict]:
+    """Відновлює контекст розмови після рестарту як список {role, content}."""
+    if _USE_PG:
+        try:
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT user_msg, bot_reply FROM conversations
+                           WHERE client_id = %s AND chat_id = %s
+                           ORDER BY created_at DESC LIMIT %s""",
+                        (client_id, chat_id, limit),
+                    )
+                    rows = cur.fetchall()
+        except Exception:
+            return []
+    else:
+        try:
+            with _sqlite_conn() as conn:
+                rows = conn.execute(
+                    """SELECT user_msg, bot_reply FROM conversations
+                       WHERE client_id = ? AND chat_id = ?
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (client_id, chat_id, limit),
+                ).fetchall()
+        except Exception:
+            return []
+
+    history = []
+    for user_msg, bot_reply in reversed(rows):
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": bot_reply})
+    return history
+
+
 def get_review(client_id: str, limit: int = 10, only_low: bool = False) -> list[dict]:
     if _USE_PG:
         return _review_pg(client_id, limit, only_low)
