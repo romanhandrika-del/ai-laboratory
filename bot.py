@@ -539,10 +539,6 @@ async def handle_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     document = msg.document
     caption = (msg.text or msg.caption or "").strip()
 
-    # Якщо менеджер переслав пост з каналу — логуємо ID каналу для ARCHIVE_CHANNEL_ID
-    if msg.forward_from_chat:
-        logger.info("forward_from_chat.id = %s", msg.forward_from_chat.id)
-
     # Парсимо override з caption: /analyze pricelist або /analyze ad
     override_kind = ""
     for word in caption.lower().split():
