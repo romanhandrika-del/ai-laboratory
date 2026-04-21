@@ -25,6 +25,7 @@ from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
+from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
 
 load_dotenv()
@@ -46,6 +47,7 @@ brain_archive = (
 
 # Менеджер для ескалацій
 MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID")
+ARCHIVE_CHANNEL_ID = os.getenv("ARCHIVE_CHANNEL_ID", "")
 
 # Conversation history: {chat_id: [messages]}
 _history: dict[int, list[dict]] = {}
@@ -95,8 +97,12 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
     chat_id = update.effective_chat.id
-    user_text = update.message.text or ""
+    user_text = (update.message.text or update.message.caption or "").strip()
+    if not user_text:
+        return
 
     logger.info(f"[chat={chat_id}] Вхідне: {user_text[:80]}")
 
@@ -156,6 +162,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Голосові повідомлення Telegram → Whisper → Sales Agent."""
+    if not update.message:
+        return
     chat_id = update.effective_chat.id
     voice = update.message.voice
 
@@ -493,6 +501,124 @@ async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_html(text)
 
 
+async def _archive_file(context: ContextTypes.DEFAULT_TYPE, msg) -> tuple[str, int]:
+    """Пересилає фото/документ у Archive Channel. Повертає (file_id, message_id)."""
+    if not ARCHIVE_CHANNEL_ID:
+        return "", 0
+    try:
+        if msg.photo:
+            sent = await context.bot.send_photo(
+                chat_id=ARCHIVE_CHANNEL_ID,
+                photo=msg.photo[-1].file_id,
+                caption=f"📥 Аналіз | chat={msg.chat_id} | {msg.date.isoformat()}",
+            )
+            return sent.photo[-1].file_id, sent.message_id
+        elif msg.document:
+            sent = await context.bot.send_document(
+                chat_id=ARCHIVE_CHANNEL_ID,
+                document=msg.document.file_id,
+                caption=f"📥 Аналіз | chat={msg.chat_id} | {msg.date.isoformat()}",
+            )
+            return sent.document.file_id, sent.message_id
+    except Exception as e:
+        logger.error("Archive Channel forward помилка: %s", e)
+    return "", 0
+
+
+async def handle_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /analyze або фото/документ з caption /analyze — Multimodal Analyst."""
+    if update.message is None:
+        return
+    chat_id = update.effective_chat.id
+    if str(chat_id) != MANAGER_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Доступ заборонено")
+        return
+
+    msg = update.message
+    photo = msg.photo
+    document = msg.document
+    caption = (msg.text or msg.caption or "").strip()
+
+    # Якщо менеджер переслав пост з каналу — логуємо ID каналу для ARCHIVE_CHANNEL_ID
+    if msg.forward_from_chat:
+        logger.info("forward_from_chat.id = %s", msg.forward_from_chat.id)
+
+    # Парсимо override з caption: /analyze pricelist або /analyze ad
+    override_kind = ""
+    for word in caption.lower().split():
+        if word in ("pricelist", "ad", "realty", "analytics"):
+            override_kind = word
+            break
+
+    if not photo and not document:
+        await msg.reply_text(
+            "Надішліть фото або PDF разом з командою /analyze.\n"
+            "Приклади:\n"
+            "  • /analyze (авто-визначення типу)\n"
+            "  • /analyze pricelist (для прайс-листу)\n"
+            "  • /analyze ad (для реклами)\n"
+            "  • /analyze realty (для нерухомості)\n"
+            "  • /analyze analytics (для дашборду)"
+        )
+        return
+
+    await msg.reply_text("⏳ Аналізую файл... (~15-30 секунд)")
+
+    # 1. Архівуємо оригінал у канал-архів (паралельно з завантаженням)
+    archive_task = asyncio.create_task(_archive_file(context, msg))
+
+    try:
+        if photo:
+            tg_file = await context.bot.get_file(photo[-1].file_id)
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+            media_type = "image/jpeg"
+        else:
+            tg_file = await context.bot.get_file(document.file_id)
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+            mime = document.mime_type or ""
+            media_type = mime if mime else "application/octet-stream"
+    except Exception as e:
+        logger.error("handle_analyze: завантаження файлу: %s", e)
+        await msg.reply_text("❌ Не вдалося завантажити файл. Спробуйте ще раз.")
+        archive_task.cancel()
+        return
+
+    source_tg_file_id, source_tg_msg_id = await archive_task
+
+    # 2. Аналізуємо
+    agent = MultimodalAnalystAgent(client_id="default")
+    result = await agent.analyze(
+        file_bytes, media_type, override_kind,
+        source_tg_file_id=source_tg_file_id,
+        source_tg_msg_id=source_tg_msg_id,
+    )
+
+    if result.get("error"):
+        await msg.reply_text(f"❌ {result['error']}")
+        return
+
+    # 3. Відповідь менеджеру
+    await msg.reply_html(result["summary_html"])
+
+    report_md = result.get("report_md", "")
+    if report_md:
+        import io
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(report_md.encode()),
+            filename=f"analysis-{result.get('kind','report').lower().replace(' ','_')}.md",
+            caption="📊 Повний звіт Multimodal Analyst",
+        )
+
+    # Підказка при низькій впевненості
+    if result.get("confidence") == "низька":
+        await msg.reply_text(
+            "💡 Якщо тип визначено невірно — надішліть файл знову з caption:\n"
+            "`/analyze pricelist` · `/analyze ad` · `/analyze realty` · `/analyze analytics`",
+            parse_mode="Markdown",
+        )
+
+
 async def _ig_webhook_receive(request: web.Request) -> web.Response:
     """POST /instagram/webhook — вхідні DM від Sendrules."""
     secret = request.headers.get("X-Webhook-Secret")
@@ -596,7 +722,13 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("rollback", handle_rollback))
     tg_app.add_handler(CommandHandler("design", handle_design))
     tg_app.add_handler(CommandHandler("train", handle_train))
+    tg_app.add_handler(CommandHandler("analyze", handle_analyze))
     tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Фото або документ з caption /analyze → Multimodal Analyst
+    tg_app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.ALL) & filters.CaptionRegex(r"(?i)^/analyze"),
+        handle_analyze,
+    ))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return tg_app
 

@@ -1,0 +1,4 @@
+targets:
+  - name: "Etalhome"
+    url: "https://etalhome.com"
+    client_id: "etalhome"

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tail *)",
+      "Bash(pkill *)",
+      "Bash(curl *)",
+      "Bash(ps aux *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)"
+    ]
+  }
+}

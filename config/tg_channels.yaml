@@ -1,0 +1,35 @@
+# ================================================================
+# Telegram канали для моніторингу — Agent #2d
+#
+# username:    @username каналу або посилання t.me/username
+# name:        зручна назва для позначки у повідомленні
+# keywords:    список ключових слів для фільтрації (порожньо = всі повідомлення)
+# min_length:  мінімальна довжина повідомлення (символів), коротші ігноруються
+# summarize:   true = довгі повідомлення (>500 символів) скорочує Claude
+# ================================================================
+
+channels:
+  - username: "durov"
+    name: "Павло Дуров"
+    keywords: []
+    min_length: 50
+    summarize: true
+
+  - username: "aiffring"
+    name: "AI fring"
+    keywords: []
+    min_length: 50
+    summarize: true
+
+  - username: "vladimir_kkkkk"
+    name: "Vladimir"
+    keywords: []
+    min_length: 50
+    summarize: true
+
+  # Шаблон для нового каналу:
+  # - username: "channel_username"
+  #   name: "Назва каналу"
+  #   keywords: ["ключове слово", "інше слово"]   # порожньо = всі пости
+  #   min_length: 50
+  #   summarize: true
