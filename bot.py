@@ -625,6 +625,10 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400)
 
+    # Логуємо повний сирий payload — щоб побачити що SendPulse надсилає для фото
+    import json as _json
+    logger.warning("IG RAW PAYLOAD: %s", _json.dumps(body, ensure_ascii=False)[:1000])
+
     user_id = body.get("user_id", "")
     message = body.get("message", "").strip()
     source = body.get("source", "instagram")
