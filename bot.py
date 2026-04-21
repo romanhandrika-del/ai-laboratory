@@ -645,7 +645,8 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
 
     try:
         # Якщо прийшло фото/PDF — обробляємо через Claude Vision + Google OCR
-        if file_url:
+        # file_url може прийти як {{last_message}} — перевіряємо що це справжній URL
+        if file_url and file_url.startswith("http") and file_type != "text":
             from agents.instagram.file_handler import handle_file_url
             from agents.instagram.instagram_agent import _history, MAX_HISTORY
             context = _history.get(user_id, [])
