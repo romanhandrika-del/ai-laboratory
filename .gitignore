@@ -6,3 +6,4 @@ logs/
 data/
 .DS_Store
 nohup.out
+.claude.json
