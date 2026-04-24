@@ -27,6 +27,7 @@ from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
 from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
+from core.orchestrator import OrchestratorAgent
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -35,6 +36,15 @@ init_conv_db()
 
 # Ініціалізація агента
 sales_agent = create_sales_agent()
+
+# Registry агентів для OrchestratorAgent
+_agent_registry = {
+    sales_agent.agent_id: sales_agent,
+    "website-audit-v1": WebsiteAuditAgent(client_id="default"),
+    "website-fix-v1": WebsiteFixAgent(client_id="default"),
+    "web-design-v1": WebDesignAgent(client_id="default"),
+    "multimodal-analyst-v1": MultimodalAnalystAgent(client_id="default"),
+}
 
 # Brain Archive (якщо є BRAIN_SHEET_ID — логуємо, якщо ні — пропускаємо)
 _brain_sheet_id = os.getenv("BRAIN_SHEET_ID")
@@ -100,6 +110,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
     chat_id = update.effective_chat.id
+    agent = OrchestratorAgent(registry=_agent_registry) if str(chat_id) == MANAGER_TELEGRAM_ID else sales_agent
     user_text = (update.message.text or update.message.caption or "").strip()
     if not user_text:
         return
@@ -109,13 +120,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Формуємо повідомлення для агента
     message = AgentMessage(
         content=user_text,
-        client_id=sales_agent.client_id,
+        client_id=agent.client_id,
         context=_get_history(chat_id),
         metadata={"chat_id": chat_id, "source": "telegram"},
     )
 
     # Запускаємо агента
-    result = sales_agent.run(message)
+    result = agent.run(message)
 
     # Зберігаємо в history
     _add_to_history(chat_id, "user", user_text)
@@ -123,7 +134,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Логуємо розмову в SQLite
     save_conversation(
-        client_id=sales_agent.client_id,
+        client_id=agent.client_id,
         chat_id=chat_id,
         user_msg=user_text,
         bot_reply=result.content,
@@ -153,7 +164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 result=result,
                 task=user_text[:100],
                 sentiment="neutral",
-                prompt_version=sales_agent.prompt_version,
+                prompt_version=agent.prompt_version,
             )
             brain_archive.write(record)
         except Exception as e:

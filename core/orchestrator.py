@@ -31,12 +31,14 @@ ORCHESTRATOR_PROMPT = """
 class OrchestratorAgent(BaseAgent):
     def __init__(self, registry: dict):
         self.registry = registry  # {"agent_id": agent_instance}
+        self.client_id = "owner"
         agent_list = ", ".join(registry.keys())
         super().__init__(
             agent_id="orchestrator-v1",
             model=MODEL_SONNET,
             system_prompt=ORCHESTRATOR_PROMPT.format(available_agents=agent_list),
             max_tokens=500,
+            prompt_version="1.0",
         )
 
     def run(self, message: AgentMessage) -> AgentResult:
