@@ -58,7 +58,9 @@ class BaseAgent(ABC):
         model = model or self.model
         context = message.context[-SLIDING_WINDOW:]
 
-        messages = context + [{"role": "user", "content": message.content}]
+        # API приймає тільки role і content — стрипаємо зайві поля (ts, meta тощо)
+        messages = [{"role": m["role"], "content": m["content"]} for m in context]
+        messages.append({"role": "user", "content": message.content})
 
         for attempt, delay in enumerate([0] + RETRY_DELAYS):
             if delay:
