@@ -1,16 +1,13 @@
 """
-Sales Agent Trainer — аналізує реальні діалоги і пише пропозиції покращення в Google Sheets.
+Sales Agent Trainer — аналізує реальні діалоги і зберігає пропозиції покращення в Neon.
 
-Пропозиції → аркуш "Пропозиції" у BRAIN_SHEET_ID таблиці.
+Пропозиції → таблиця trainer_suggestions.
 Менеджер переглядає вручну і переносить у FAQ/промпт.
 """
 
 import json
-import os
-from datetime import datetime
-
-from anthropic import Anthropic
-from core.conversation_storage import get_review
+from anthropic import AsyncAnthropic
+from core import db
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,58 +51,26 @@ def _format_dialogs(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _write_to_sheets(suggestions: list[dict], sheet_id: str, credentials_json: str) -> int:
-    """Записує пропозиції в аркуш 'Пропозиції'. Повертає кількість записаних рядків."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    creds = Credentials.from_service_account_info(
-        json.loads(credentials_json),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(sheet_id)
-
-    try:
-        ws = spreadsheet.worksheet("Пропозиції")
-    except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title="Пропозиції", rows=500, cols=6)
-        ws.append_row(["Дата", "Тип", "Пріоритет", "Проблема", "Пропозиція", "Статус"])
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    rows = [
-        [ts, s.get("type", ""), s.get("priority", ""), s.get("problem", ""), s.get("suggestion", ""), "Нова"]
-        for s in suggestions
-    ]
-    if rows:
-        ws.append_rows(rows)
-    return len(rows)
-
-
-def run_training(client_id: str, limit: int = 30, only_low: bool = False) -> dict:
+async def run_training(client_id: str, limit: int = 30, only_low: bool = False) -> dict:
     """
     Основна функція тренування.
     Повертає {"suggestions": [...], "written": N, "error": None}.
     """
-    sheet_id = os.getenv("BRAIN_SHEET_ID")
-    credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-    rows = get_review(client_id, limit=limit, only_low=only_low)
+    rows = await db.get_dialogs_review(client_id, limit=limit, only_low=only_low)
     if not rows:
         return {"suggestions": [], "written": 0, "error": None, "msg": "Немає діалогів для аналізу."}
 
     dialogs_text = _format_dialogs(rows)
 
-    client = Anthropic()
+    client = AsyncAnthropic()
     try:
-        response = client.messages.create(
+        response = await client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
             system=_ANALYSIS_PROMPT,
             messages=[{"role": "user", "content": f"Проаналізуй ці діалоги:\n\n{dialogs_text}"}],
         )
         raw = response.content[0].text.strip()
-        # Знаходимо JSON-масив у відповіді
         start = raw.find("[")
         end = raw.rfind("]") + 1
         suggestions = json.loads(raw[start:end]) if start >= 0 else []
@@ -114,14 +79,20 @@ def run_training(client_id: str, limit: int = 30, only_low: bool = False) -> dic
         return {"suggestions": [], "written": 0, "error": str(e)}
 
     written = 0
-    if suggestions and sheet_id and credentials_json:
+    if suggestions:
         try:
-            written = _write_to_sheets(suggestions, sheet_id, credentials_json)
-            logger.info("Trainer: записано %d пропозицій у Sheets", written)
+            for s in suggestions:
+                await db.save_trainer_suggestion(
+                    client_id=client_id,
+                    type=s.get("type", ""),
+                    priority=s.get("priority", ""),
+                    problem=s.get("problem", ""),
+                    suggestion=s.get("suggestion", ""),
+                )
+            written = len(suggestions)
+            logger.info("Trainer: збережено %d пропозицій у Neon", written)
         except Exception as e:
-            logger.error("Trainer Sheets error: %s", e)
+            logger.error("Trainer DB error: %s", e)
             return {"suggestions": suggestions, "written": 0, "error": str(e)}
-    elif suggestions and (not sheet_id or not credentials_json):
-        logger.warning("Trainer: BRAIN_SHEET_ID або GOOGLE_CREDENTIALS_JSON не налаштовані — пропозиції не збережено")
 
     return {"suggestions": suggestions, "written": written, "error": None}

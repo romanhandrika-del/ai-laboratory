@@ -16,8 +16,8 @@ import os
 import anthropic
 from anthropic import APIStatusError
 
+from core import db
 from core.logger import get_logger
-from core.analysis_storage import init_db, save_analysis
 from agents.multimodal_analyst.analyst_generator import (
     build_system_prompt,
     parse_detection,
@@ -44,7 +44,6 @@ class MultimodalAnalystAgent:
 
     def __init__(self, client_id: str = "default"):
         self.client_id = client_id
-        init_db()
 
     async def analyze(
         self,
@@ -88,7 +87,7 @@ class MultimodalAnalystAgent:
 
         kind, confidence = parse_detection(report_md)
 
-        save_analysis(
+        await db.save_analysis(
             client_id=self.client_id,
             kind=kind,
             confidence=confidence,
