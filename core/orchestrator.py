@@ -58,13 +58,14 @@ class OrchestratorAgent:
         user_text: str,
         user_id: str,
         source: str,
+        is_manager: bool = False,
     ) -> AgentResult:
         """
         Головна точка входу для вільного тексту.
         Фото/PDF обробляються через fast-path handle_analyze у bot.py.
         """
         try:
-            return await self._route(user_text, user_id, source)
+            return await self._route(user_text, user_id, source, is_manager)
         except Exception as exc:
             logger.error("[orchestrator] unhandled exception: %s", exc, exc_info=True)
             return _simple_result(
@@ -77,6 +78,7 @@ class OrchestratorAgent:
         user_text: str,
         user_id: str,
         source: str,
+        is_manager: bool = False,
     ) -> AgentResult:
         state = await db.get_session_state(self.client_id, user_id, source)
         awaiting = state.get("awaiting") if state else None
@@ -118,8 +120,21 @@ class OrchestratorAgent:
                 self.client_id,
             )
 
-        else:  # sales або unknown → Sales Agent (з KB як fallback)
+        else:  # sales або unknown
             await db.clear_session_state(self.client_id, user_id, source)
+            if is_manager:
+                return _simple_result(
+                    "🤖 Оркестрант не розпізнав команду. Доступні:\n"
+                    "/audit <url> — SEO-аудит сайту\n"
+                    "/fix <url> — генерація фіксів\n"
+                    "/push <url> — деплой фіксів\n"
+                    "/rollback <url> — відкат\n"
+                    "/design <url> — дизайн-пакет\n"
+                    "/analyze + фото/PDF — аналіз файлу\n"
+                    "/train — тренування Sales Agent\n"
+                    "/review — огляд розмов",
+                    self.client_id,
+                )
             return await self._run_sales(user_text, user_id, source)
 
     # ── Адаптери ─────────────────────────────────────────────────────────────

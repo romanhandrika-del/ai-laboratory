@@ -97,6 +97,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_text=user_text,
         user_id=str(chat_id),
         source="telegram",
+        is_manager=MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID),
     )
 
     is_sales = result.agent_id.startswith("sales")
@@ -162,29 +163,30 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     logger.info("[chat=%d] Голосове розпізнано: %s", chat_id, user_text[:80])
 
-    history = await db.load_history(sales_agent.client_id, str(chat_id), "telegram", limit=TG_HISTORY_LIMIT)
-
-    result = sales_agent.run(AgentMessage(
-        content=user_text,
-        client_id=sales_agent.client_id,
-        context=history,
-        metadata={"chat_id": chat_id, "source": "telegram_voice"},
-    ))
-
-    await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", f"[voice] {user_text}")
-    await db.save_message(
-        sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
-        meta={
-            "confidence": result.confidence,
-            "needs_human": result.needs_human,
-            "model_used": result.model_used,
-            "cost_usd": result.cost_usd,
-        },
+    result = await orchestrator.route(
+        user_text=user_text,
+        user_id=str(chat_id),
+        source="telegram_voice",
+        is_manager=MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID),
     )
+
+    is_sales = result.agent_id.startswith("sales")
+    if is_sales:
+        await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", f"[voice] {user_text}")
+        await db.save_message(
+            sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
+            meta={
+                "confidence": result.confidence,
+                "needs_human": result.needs_human,
+                "model_used": result.model_used,
+                "cost_usd": result.cost_usd,
+            },
+        )
 
     await update.message.reply_text(result.content)
 
     if result.needs_human:
+        history = await db.load_history(sales_agent.client_id, str(chat_id), "telegram", limit=6)
         await _notify_manager(context, chat_id, user_text, result.content, history)
 
 
