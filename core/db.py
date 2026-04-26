@@ -63,9 +63,12 @@ CREATE TABLE IF NOT EXISTS analysis_history (
     source_tg_file_id   TEXT,
     source_tg_msg_id    BIGINT,
     report_text         TEXT,
+    metadata            JSONB        DEFAULT '{}',
     created_at          TIMESTAMPTZ  DEFAULT NOW()
 );
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_analysis_client_created ON analysis_history(client_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analysis_metadata_gin ON analysis_history USING GIN (metadata);
 
 CREATE TABLE IF NOT EXISTS session_state (
     id           SERIAL PRIMARY KEY,
@@ -88,8 +91,8 @@ async def init() -> None:
         raise RuntimeError("DATABASE_URL не знайдено в env")
     _pool = await asyncpg.create_pool(
         database_url,
-        min_size=2,
-        max_size=10,
+        min_size=1,
+        max_size=4,
         init=_setup_conn,
     )
     async with _pool.acquire() as conn:
@@ -281,17 +284,19 @@ async def save_analysis(
     report_text: str = "",
     source_tg_file_id: str = "",
     source_tg_msg_id: int = 0,
+    metadata: dict | None = None,
 ) -> None:
     pool = _get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO analysis_history
-               (client_id, kind, confidence, source_tg_file_id, source_tg_msg_id, report_text)
-               VALUES ($1, $2, $3, $4, $5, $6)""",
+               (client_id, kind, confidence, source_tg_file_id, source_tg_msg_id, report_text, metadata)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
             client_id, kind, confidence,
             source_tg_file_id or None,
             source_tg_msg_id or None,
             report_text,
+            metadata or {},
         )
 
 
