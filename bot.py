@@ -678,8 +678,46 @@ async def _run_aiohttp(tg_app, port: int) -> None:
     await asyncio.Event().wait()
 
 
+async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автоматичний запуск тренування щодня о 9:00 Київ (06:00 UTC)."""
+    if not MANAGER_TELEGRAM_ID:
+        return
+    try:
+        from agents.sales.trainer import run_training
+        result = await run_training(sales_agent.client_id, 30, only_low=False)
+        if result.get("error"):
+            await context.bot.send_message(
+                chat_id=MANAGER_TELEGRAM_ID,
+                text=f"⚠️ Авто-тренування: помилка\n{result['error']}",
+            )
+            return
+        suggestions = result.get("suggestions", [])
+        written = result.get("written", 0)
+        if not suggestions:
+            return
+        lines = [f"🧠 <b>Авто-тренування завершено</b>\nЗаписано: {written} пропозицій\n"]
+        for s in suggestions[:5]:
+            prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
+            lines.append(
+                f"{prio} <b>{s.get('type', '')} — {s.get('priority', '')}</b>\n"
+                f"{s.get('suggestion', '')}\n"
+            )
+        if len(suggestions) > 5:
+            lines.append(f"<i>...ще {len(suggestions) - 5} пропозицій у Sheets</i>")
+        await context.bot.send_message(
+            chat_id=MANAGER_TELEGRAM_ID,
+            text="\n".join(lines),
+            parse_mode="HTML",
+        )
+        logger.info("Авто-тренування завершено: %d пропозицій", len(suggestions))
+    except Exception as e:
+        logger.error("scheduled_train error: %s", e)
+
+
 def _build_tg_app(token: str):
     tg_app = ApplicationBuilder().token(token).build()
+    from datetime import time as dt_time
+    tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0))
     tg_app.add_handler(CommandHandler("start", handle_start))
     tg_app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
     tg_app.add_handler(CommandHandler("review", handle_review))
