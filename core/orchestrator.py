@@ -63,6 +63,21 @@ class OrchestratorAgent:
         Головна точка входу для вільного тексту.
         Фото/PDF обробляються через fast-path handle_analyze у bot.py.
         """
+        try:
+            return await self._route(user_text, user_id, source)
+        except Exception as exc:
+            logger.error("[orchestrator] unhandled exception: %s", exc, exc_info=True)
+            return _simple_result(
+                "Вибачте, сталася помилка. Спробуйте ще раз 🙏",
+                self.client_id,
+            )
+
+    async def _route(
+        self,
+        user_text: str,
+        user_id: str,
+        source: str,
+    ) -> AgentResult:
         state = await db.get_session_state(self.client_id, user_id, source)
         awaiting = state.get("awaiting") if state else None
 
@@ -119,6 +134,8 @@ class OrchestratorAgent:
         ))
 
     async def _run_audit(self, url: str) -> AgentResult:
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         result = await self._audit.audit(url)
         if result.get("error"):
             return _simple_result(
