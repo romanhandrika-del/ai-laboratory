@@ -77,6 +77,11 @@ ENVIRONMENT               # production / development
 **JSON Parsing**
 → Claude іноді додає текст до JSON. Завжди: `raw.find("[")` або Pydantic для валідації.
 
+**Neon history → Anthropic API (КРИТИЧНО)**
+→ Neon зберігає повідомлення з полями `ts` і `meta`. Anthropic API приймає ТІЛЬКИ `role` і `content`.
+→ Фікс у `core/base_agent.py`: стрипати зайві поля перед API-викликом.
+→ Симптом: перше повідомлення працює, всі наступні — "технічна помилка".
+
 **Memory Limit 256MB (Railway)**
 → Не завантажувати великі бібліотеки у пам'ять без потреби (особливо ML-моделі).
 

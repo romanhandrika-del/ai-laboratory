@@ -83,6 +83,19 @@ async def _notify_manager(
         logger.error(f"Помилка надсилання менеджеру: {e}")
 
 
+_HEAVY_KEYWORDS = (
+    "аудит", "audit", "фікс", "fix", "push", "деплой", "дизайн", "design",
+    "rollback", "відкат", "pipeline", "під ключ", "аутсорс", "повний цикл",
+)
+
+
+def _is_heavy_request(text: str, is_manager: bool) -> bool:
+    if not is_manager:
+        return False
+    t = text.lower()
+    return any(k in t for k in _HEAVY_KEYWORDS)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -93,25 +106,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info(f"[chat={chat_id}] Вхідне: {user_text[:80]}")
 
+    is_manager = bool(MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID))
+
+    if _is_heavy_request(user_text, is_manager):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
     result = await orchestrator.route(
         user_text=user_text,
         user_id=str(chat_id),
         source="telegram",
-        is_manager=MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID),
+        is_manager=is_manager,
     )
 
     is_sales = result.agent_id.startswith("sales")
-    if is_sales:
-        await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", user_text)
-        await db.save_message(
-            sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
-            meta={
-                "confidence": result.confidence,
-                "needs_human": result.needs_human,
-                "model_used": result.model_used,
-                "cost_usd": result.cost_usd,
-            },
-        )
+    await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", user_text)
+    await db.save_message(
+        sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
+        meta={
+            "agent_id": result.agent_id,
+            "confidence": result.confidence,
+            "needs_human": result.needs_human,
+            "model_used": result.model_used,
+            "cost_usd": result.cost_usd,
+        },
+    )
 
     if is_sales:
         await update.message.reply_text(result.content)
@@ -170,7 +188,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_text=user_text,
         user_id=str(chat_id),
         source="telegram_voice",
-        is_manager=MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID),
+        is_manager=bool(MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID)),
     )
 
     is_sales = result.agent_id.startswith("sales")

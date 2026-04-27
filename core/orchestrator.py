@@ -263,13 +263,20 @@ class OrchestratorAgent:
         else:
             await db.clear_session_state(self.client_id, user_id, source)
             if is_manager:
-                return await self._run_orchestrator_llm(user_text)
+                return await self._run_orchestrator_llm(user_text, user_id, source)
             return await self._run_sales(user_text, user_id, source)
 
     # ── Адаптери ──────────────────────────────────────────────────────────────
 
-    async def _run_orchestrator_llm(self, text: str) -> AgentResult:
+    async def _run_orchestrator_llm(
+        self, text: str, user_id: str = "", source: str = ""
+    ) -> AgentResult:
         system_prompt = _load_orchestrator_prompt()
+        history: list[dict] = []
+        if user_id and source:
+            raw = await db.load_history(self.client_id, user_id, source, limit=6)
+            history = [{"role": m["role"], "content": m["content"]} for m in raw]
+        messages = history + [{"role": "user", "content": text}]
         try:
             response = self._llm.messages.create(
                 model=MODEL_HAIKU,
@@ -279,7 +286,7 @@ class OrchestratorAgent:
                     "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }],
-                messages=[{"role": "user", "content": text}],
+                messages=messages,
             )
             content = response.content[0].text
         except Exception as exc:
