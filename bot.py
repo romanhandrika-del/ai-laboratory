@@ -113,7 +113,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             },
         )
 
-    await update.message.reply_text(result.content)
+    if is_sales:
+        await update.message.reply_text(result.content)
+    else:
+        await update.message.reply_html(result.content)
 
     logger.info(
         f"[chat={chat_id}] agent={result.agent_id} confidence={result.confidence:.2f} "
