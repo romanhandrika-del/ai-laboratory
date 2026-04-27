@@ -1,7 +1,7 @@
 """
-Audit Storage — SQLite для збереження audit_history та design_history.
+Audit Storage — SQLite для audit_history.
 
-fix_history перенесено до Neon (core/db.py).
+fix_history та design_history перенесено до Neon (core/db.py).
 """
 
 import sqlite3
@@ -27,18 +27,6 @@ CREATE TABLE IF NOT EXISTS audit_history (
 
 
 
-_CREATE_DESIGN_TABLE = """
-CREATE TABLE IF NOT EXISTS design_history (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id    TEXT    NOT NULL DEFAULT 'default',
-    source       TEXT    NOT NULL,
-    mode         TEXT    NOT NULL,
-    dir_path     TEXT    NOT NULL,
-    generated_at TEXT    NOT NULL
-);
-"""
-
-
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -52,7 +40,6 @@ def init_db() -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
         conn.execute(_CREATE_TABLE)
-        conn.execute(_CREATE_DESIGN_TABLE)
         conn.commit()
     logger.info("Audit DB ініціалізована: %s", _DB_PATH)
 
@@ -80,25 +67,3 @@ def get_last_audit(client_id: str, url: str) -> dict | None:
 
 
 
-def save_design(client_id: str, source: str, mode: str, dir_path: str) -> int:
-    """Зберігає запис design-генерації. Повертає id запису."""
-    now = datetime.now().isoformat()
-    with _get_conn() as conn:
-        cursor = conn.execute(
-            "INSERT INTO design_history (client_id, source, mode, dir_path, generated_at) VALUES (?,?,?,?,?)",
-            (client_id, source, mode, dir_path, now),
-        )
-        conn.commit()
-        row_id = cursor.lastrowid
-    logger.info("Design збережено: %s mode=%s", source[:80], mode)
-    return row_id
-
-
-def get_last_design(client_id: str, source: str) -> dict | None:
-    """Повертає останній design-пакет для source або None."""
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM design_history WHERE client_id=? AND source=? ORDER BY generated_at DESC LIMIT 1",
-            (client_id, source),
-        ).fetchone()
-    return dict(row) if row else None

@@ -70,6 +70,16 @@ ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}
 CREATE INDEX IF NOT EXISTS idx_analysis_client_created ON analysis_history(client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analysis_metadata_gin ON analysis_history USING GIN (metadata);
 
+CREATE TABLE IF NOT EXISTS design_history (
+    id           SERIAL PRIMARY KEY,
+    client_id    TEXT         NOT NULL DEFAULT 'default',
+    source       TEXT         NOT NULL,
+    mode         TEXT         NOT NULL,
+    dir_path     TEXT         NOT NULL,
+    generated_at TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_design_history_client ON design_history(client_id, generated_at DESC);
+
 CREATE TABLE IF NOT EXISTS fix_history (
     id           SERIAL PRIMARY KEY,
     client_id    TEXT         NOT NULL DEFAULT 'default',
@@ -445,6 +455,37 @@ async def get_applied_fix_paths(client_id: str, url: str) -> list[str]:
             client_id, url,
         )
     return [r["fix_path"] for r in rows if r["fix_path"]]
+
+
+# ── Design history (Neon) ─────────────────────────────────────────────────────
+
+async def save_design(
+    client_id: str,
+    source: str,
+    mode: str,
+    dir_path: str,
+) -> int:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO design_history (client_id, source, mode, dir_path)
+               VALUES ($1, $2, $3, $4) RETURNING id""",
+            client_id, source, mode, dir_path,
+        )
+    logger.info("[db] Design збережено: %s mode=%s", source[:80], mode)
+    return row["id"]
+
+
+async def get_last_design(client_id: str, source: str) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT * FROM design_history
+               WHERE client_id=$1 AND source=$2
+               ORDER BY generated_at DESC LIMIT 1""",
+            client_id, source,
+        )
+    return dict(row) if row else None
 
 
 # ── Analysis history ──────────────────────────────────────────────────────────
