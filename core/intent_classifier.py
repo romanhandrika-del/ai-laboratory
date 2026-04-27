@@ -1,11 +1,12 @@
 """
 IntentClassifier — Haiku-класифікатор намірів для Orchestrator.
-Closed-set: sales | audit | analyze | unknown
+Повертає список дій (actions) замість одного інтенту,
+що дозволяє виконувати pipeline без додавання нових прикладів у промпт.
 """
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import anthropic
 
@@ -16,54 +17,60 @@ logger = get_logger(__name__)
 
 _URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+', re.IGNORECASE)
 
-_SYSTEM = """Ти — диспетчер AI-платформи. Класифікуй вхідне повідомлення.
+_SYSTEM = """Ти — диспетчер AI-платформи. Розклади запит на список дій.
 
-Класи:
-- sales: питання про товар, ціну, доставку, розміри, матеріали, замовлення, консультація, загальне вітання
-- audit: прохання перевірити / оцінити / зробити аудит сайту (може містити URL)
-- analyze: прохання проаналізувати фото, зображення, PDF, документ, файл
-- train: аналіз якості діалогів агента, тренування — ПЕРСПЕКТИВА (що змінити у поведінці)
-- review: перегляд статистики, огляд розмов, "останні діалоги" — РЕТРОСПЕКТИВА (що вже відбулось)
-- fix: генерація SEO-фіксів для сайту (може містити URL)
-- push: деплой/заливка фіксів на сервер (може містити URL)
-- rollback: відкат змін, відновлення попередньої версії плагіну
-- design: генерація дизайн-пакету, редизайн сайту, HTML-макет
-- unknown: все що не підходить вище
+Доступні дії (виконуються у зазначеному порядку):
+- audit    — SEO-аудит сайту
+- fix      — генерація SEO-фіксів
+- push     — деплой фіксів на сервер
+- rollback — відкат змін на сервері
+- design   — генерація дизайн-пакету / редизайн
+- train    — аналіз якості діалогів, тренування агента
+- review   — статистика і перегляд розмов
+- analyze  — аналіз фото, PDF, зображення
+- sales    — консультація, ціни, загальне питання
+
+Правила:
+- Для запитів типу "аудит + фікси" або "зроби все по SEO" → кілька дій у правильному порядку
+- Деплой (push) іде ПІСЛЯ fix; аудит (audit) іде ДО fix
+- Якщо запит незрозумілий або не стосується платформи → ["sales"]
+- URL якщо є — витягни окремо, інакше ""
 
 Відповідай ТІЛЬКИ JSON без пояснень:
-{"intent": "sales|audit|analyze|train|review|fix|push|rollback|design|unknown", "confidence": 0.0}
+{"actions": ["action1", "action2"], "url": "", "confidence": 0.0}
 
 Приклади:
-- "скільки коштує перегородка 2м?" → {"intent": "sales", "confidence": 0.97}
-- "перевір мій сайт https://example.com" → {"intent": "audit", "confidence": 0.98}
-- "зроби аудит сайту" → {"intent": "audit", "confidence": 0.93}
-- "проаналізуй це фото" → {"intent": "analyze", "confidence": 0.95}
-- "привіт" → {"intent": "sales", "confidence": 0.85}
-- "що таке SEO?" → {"intent": "sales", "confidence": 0.72}
-- "проаналізуй діалоги агента" → {"intent": "train", "confidence": 0.96}
-- "агент відповідає грубо, виправ" → {"intent": "train", "confidence": 0.95}
-- "покращ відповіді бота" → {"intent": "train", "confidence": 0.93}
-- "який останній діалог?" → {"intent": "review", "confidence": 0.94}
-- "покажи статистику розмов" → {"intent": "review", "confidence": 0.97}
-- "скільки ескалацій сьогодні?" → {"intent": "review", "confidence": 0.95}
-- "зроби фікси для etalhome.com" → {"intent": "fix", "confidence": 0.96}
-- "виправ помилки на сайті" → {"intent": "fix", "confidence": 0.93}
-- "згенеруй SEO-фікси" → {"intent": "fix", "confidence": 0.95}
-- "залий фікси на сервер" → {"intent": "push", "confidence": 0.95}
-- "задеплой зміни https://etalhome.com" → {"intent": "push", "confidence": 0.97}
-- "деплой фіксів" → {"intent": "push", "confidence": 0.94}
-- "відкати зміни на сайті" → {"intent": "rollback", "confidence": 0.96}
-- "відновити попередню версію плагіну" → {"intent": "rollback", "confidence": 0.94}
-- "зроби дизайн для сайту" → {"intent": "design", "confidence": 0.95}
-- "редизайн etalhome.com" → {"intent": "design", "confidence": 0.97}
-- "зроби макет лендінгу" → {"intent": "design", "confidence": 0.94}"""
+- "скільки коштує перегородка?" → {"actions": ["sales"], "url": "", "confidence": 0.97}
+- "зроби аудит https://example.com" → {"actions": ["audit"], "url": "https://example.com", "confidence": 0.98}
+- "згенеруй SEO-фікси" → {"actions": ["fix"], "url": "", "confidence": 0.95}
+- "залий фікси на сервер" → {"actions": ["push"], "url": "", "confidence": 0.95}
+- "аудит і фікси для example.com" → {"actions": ["audit", "fix"], "url": "https://example.com", "confidence": 0.96}
+- "аудит + фікси + деплой" → {"actions": ["audit", "fix", "push"], "url": "", "confidence": 0.97}
+- "повний SEO для etalhome" → {"actions": ["audit", "fix", "push"], "url": "https://etalhome.com", "confidence": 0.97}
+- "зроби все по SEO" → {"actions": ["audit", "fix", "push"], "url": "", "confidence": 0.95}
+- "SEO від А до Я" → {"actions": ["audit", "fix", "push"], "url": "", "confidence": 0.96}
+- "фікси і задеплой" → {"actions": ["fix", "push"], "url": "", "confidence": 0.96}
+- "редизайн etalhome.com" → {"actions": ["design"], "url": "https://etalhome.com", "confidence": 0.97}
+- "відкати зміни" → {"actions": ["rollback"], "url": "", "confidence": 0.96}
+- "проаналізуй діалоги агента" → {"actions": ["train"], "url": "", "confidence": 0.96}
+- "покажи статистику розмов" → {"actions": ["review"], "url": "", "confidence": 0.97}
+- "проаналізуй це фото" → {"actions": ["analyze"], "url": "", "confidence": 0.95}"""
 
 
 @dataclass
 class Intent:
-    name: str           # sales | audit | analyze | train | review | fix | push | rollback | design | unknown
+    actions: list[str]      # впорядкований список дій
     confidence: float
-    extracted_url: str  # URL знайдений у тексті (може бути порожній)
+    extracted_url: str      # URL знайдений у тексті (може бути порожній)
+
+    @property
+    def name(self) -> str:
+        """Перша дія — для сумісності з існуючим роутингом."""
+        return self.actions[0] if self.actions else "unknown"
+
+    @property
+    def is_pipeline(self) -> bool:
+        return len(self.actions) > 1
 
 
 class IntentClassifier:
@@ -76,7 +83,7 @@ class IntentClassifier:
         try:
             response = self._client.messages.create(
                 model=MODEL_HAIKU,
-                max_tokens=40,
+                max_tokens=80,
                 system=[{
                     "type": "text",
                     "text": _SYSTEM,
@@ -89,14 +96,20 @@ class IntentClassifier:
             if start != -1:
                 raw = raw[start:]
             data = json.loads(raw)
-            name = data.get("intent", "unknown")
+            actions = data.get("actions", ["sales"])
+            if not isinstance(actions, list) or not actions:
+                actions = ["sales"]
+            # URL з JSON має пріоритет над витягнутим з тексту
+            url_from_json = data.get("url", "").strip()
+            if url_from_json:
+                extracted_url = url_from_json
             confidence = float(data.get("confidence", 0.5))
         except Exception as exc:
             logger.warning("IntentClassifier error: %s → fallback sales", exc)
-            name = "sales"
+            actions = ["sales"]
             confidence = 0.5
 
-        return Intent(name=name, confidence=confidence, extracted_url=extracted_url)
+        return Intent(actions=actions, confidence=confidence, extracted_url=extracted_url)
 
     @staticmethod
     def _extract_url(text: str) -> str:

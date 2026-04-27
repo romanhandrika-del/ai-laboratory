@@ -97,6 +97,24 @@ class OrchestratorAgent:
         state = await db.get_session_state(self.client_id, user_id, source)
         awaiting = state.get("awaiting") if state else None
 
+        # ── Multi-turn: чекаємо URL для pipeline ─────────────────────────────
+        if awaiting == "url_pipeline":
+            url = _extract_url(user_text) or (
+                user_text.strip() if user_text.strip().startswith("http") else ""
+            )
+            if not url and state and state.get("payload", {}).get("suggested_url"):
+                confirm = ("так", "yes", "ок", "ok", "давай", "підтвердж", "звісно")
+                if any(user_text.lower().strip().startswith(w) for w in confirm):
+                    url = state["payload"]["suggested_url"]
+            if url:
+                actions = state.get("payload", {}).get("actions", ["audit", "fix", "push"])
+                await db.clear_session_state(self.client_id, user_id, source)
+                return await self._run_pipeline(actions, url, user_id, source)
+            return _simple_result(
+                'Надішліть URL сайту (https://example.com) або підтвердіть "так" 🔗',
+                self.client_id,
+            )
+
         # ── Multi-turn: чекаємо URL (audit / fix / push / rollback) ──────────
         if awaiting in ("url", "url_fix", "url_push", "url_rollback"):
             url = _extract_url(user_text) or (
@@ -137,9 +155,36 @@ class OrchestratorAgent:
         # ── Класифікуємо намір ────────────────────────────────────────────────
         intent = self._classifier.classify(user_text)
         logger.info(
-            "[orchestrator] user=%s intent=%s conf=%.2f url=%s",
-            user_id, intent.name, intent.confidence, intent.extracted_url,
+            "[orchestrator] user=%s actions=%s conf=%.2f url=%s",
+            user_id, intent.actions, intent.confidence, intent.extracted_url,
         )
+
+        # ── Pipeline (кілька дій за раз) ──────────────────────────────────────
+        if is_manager and intent.is_pipeline:
+            url = intent.extracted_url
+            if url:
+                return await self._run_pipeline(intent.actions, url, user_id, source)
+            suggested = await self._suggest_last_url()
+            payload: dict = {"actions": intent.actions}
+            if suggested:
+                payload["suggested_url"] = suggested
+                await db.set_session_state(
+                    self.client_id, user_id, source,
+                    active_agent="pipeline", awaiting="url_pipeline", payload=payload,
+                )
+                return _simple_result(
+                    f"▶️ Pipeline: {' → '.join(intent.actions)}\n"
+                    f"Для {suggested} (останній)? Підтвердіть \"так\" або надішліть інший URL 🔗",
+                    self.client_id,
+                )
+            await db.set_session_state(
+                self.client_id, user_id, source,
+                active_agent="pipeline", awaiting="url_pipeline", payload=payload,
+            )
+            return _simple_result(
+                f"▶️ Pipeline: {' → '.join(intent.actions)}\nДля якого сайту? Надішліть URL 🔗",
+                self.client_id,
+            )
 
         # ── Клієнтські інтенти ────────────────────────────────────────────────
         if intent.name == "audit":
@@ -406,6 +451,80 @@ class OrchestratorAgent:
         except Exception as e:
             logger.error("[orchestrator] _run_design error: %s", e)
             return _simple_result(f"❌ Помилка: {e}", self.client_id, "web-design-v1")
+
+    async def _run_pipeline(
+        self,
+        actions: list[str],
+        url: str,
+        user_id: str = "",
+        source: str = "",
+    ) -> AgentResult:
+        """Виконує послідовність дій над одним URL.
+        Зупиняється перед push і чекає підтвердження від менеджера.
+        """
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        icons = {"audit": "🔍", "fix": "🔧", "push": "📤", "rollback": "↩️", "design": "🎨"}
+        pre_push = [a for a in actions if a != "push"]
+        has_push = "push" in actions
+        total = len(pre_push) + (1 if has_push else 0)
+        lines = [f"▶️ Pipeline для {url}: {' → '.join(actions)}\n"]
+        step = 0
+
+        for action in pre_push:
+            step += 1
+            icon = icons.get(action, "⚙️")
+            lines.append(f"{icon} Крок {step}/{total} — {action}...")
+            try:
+                if action == "audit":
+                    r = await self._audit.audit(url)
+                    if r.get("error"):
+                        lines.append(f"❌ {r['error']}")
+                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
+                    score = r.get("score", "—")
+                    first = (r.get("summary_text", "") or "").splitlines()[0] or "Аудит завершено."
+                    lines.append(f"✅ score={score} | {first}")
+                elif action == "fix":
+                    r = await self._fix.fix(url)
+                    if r.get("error"):
+                        lines.append(f"❌ {r['error']}")
+                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
+                    first = (r.get("summary_text", "") or "").splitlines()[0] or "Фікси готові."
+                    lines.append(f"✅ {first}")
+                elif action == "rollback":
+                    r = await self._fix.rollback(url)
+                    if r.get("error"):
+                        lines.append(f"❌ {r['error']}")
+                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
+                    lines.append(f"✅ {r.get('summary_text', 'Відкат виконано.')}")
+                elif action == "design":
+                    result = await self._run_design(url)
+                    lines.append(f"✅ {result.content.splitlines()[0]}")
+                else:
+                    lines.append(f"⚠️ Невідома дія: {action}")
+            except Exception as e:
+                logger.error("[pipeline] action=%s error: %s", action, e)
+                lines.append(f"❌ Помилка: {e}")
+                return _simple_result("\n".join(lines), self.client_id, "pipeline")
+
+        if has_push:
+            # Зберігаємо стан і чекаємо підтвердження
+            if user_id and source:
+                await db.set_session_state(
+                    self.client_id, user_id, source,
+                    active_agent="pipeline", awaiting="url_push",
+                    payload={"suggested_url": url},
+                )
+            lines.append(
+                f"\n📤 Крок {total}/{total} — push готовий.\n"
+                f"Деплоїти фікси на {url}?\n"
+                f'Підтвердіть "так" або /push 🚀'
+            )
+            return _simple_result("\n".join(lines), self.client_id, "pipeline")
+
+        lines.append("\n✅ Pipeline завершено.")
+        return _simple_result("\n".join(lines), self.client_id, "pipeline")
 
     async def _suggest_last_url(self) -> str:
         """Повертає домен останнього fix з БД для smart URL suggestion."""
