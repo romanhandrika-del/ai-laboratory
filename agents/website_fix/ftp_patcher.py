@@ -7,6 +7,7 @@ mu-plugins: /wp-content/mu-plugins/ — автозавантаження WordPre
 
 import ftplib
 import io
+import json
 import os
 import re
 from datetime import datetime
@@ -80,6 +81,15 @@ def build_mu_plugin(fixes: list[dict], url: str) -> str:
         code = re.sub(r"<!--.*?-->", "", raw_code, flags=re.DOTALL).strip()
         if not code:
             continue
+        # Валідація JSON-LD: якщо є <script type="application/ld+json"> — перевіряємо json.loads()
+        if "application/ld+json" in code:
+            json_m = re.search(r"<script[^>]*application/ld\+json[^>]*>([\s\S]*?)</script>", code)
+            if json_m:
+                try:
+                    json.loads(json_m.group(1).strip())
+                except json.JSONDecodeError as e:
+                    logger.error("JSON-LD validation failed у фіксі '%s': %s — пропускаємо", title, e)
+                    continue
         if any(tag in code for tag in ("<link", "<meta", "<script", "<title")):
             head_fixes.append((title, code))
         else:
@@ -89,6 +99,10 @@ def build_mu_plugin(fixes: list[dict], url: str) -> str:
         parts = []
         for i, (title, code) in enumerate(fixes_list):
             marker = f"{prefix}_{i}"
+            # Захист від Nowdoc-конфлікту: якщо код містить рядок закриття — пропускаємо
+            if f"\n{marker};" in code or code.startswith(f"{marker};"):
+                logger.error("Nowdoc marker conflict у фіксі '%s' (marker=%s) — пропускаємо", title, marker)
+                continue
             parts.append(f"  // {title}\n  echo <<<'{marker}'\n{code}\n{marker};\n")
         return "\n".join(parts)
 
