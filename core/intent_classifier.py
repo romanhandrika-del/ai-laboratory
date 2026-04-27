@@ -22,10 +22,16 @@ _SYSTEM = """Ти — диспетчер AI-платформи. Класифік
 - sales: питання про товар, ціну, доставку, розміри, матеріали, замовлення, консультація, загальне вітання
 - audit: прохання перевірити / оцінити / зробити аудит сайту (може містити URL)
 - analyze: прохання проаналізувати фото, зображення, PDF, документ, файл
+- train: аналіз якості діалогів агента, тренування — ПЕРСПЕКТИВА (що змінити у поведінці)
+- review: перегляд статистики, огляд розмов, "останні діалоги" — РЕТРОСПЕКТИВА (що вже відбулось)
+- fix: генерація SEO-фіксів для сайту (може містити URL)
+- push: деплой/заливка фіксів на сервер (може містити URL)
+- rollback: відкат змін, відновлення попередньої версії плагіну
+- design: генерація дизайн-пакету, редизайн сайту, HTML-макет
 - unknown: все що не підходить вище
 
 Відповідай ТІЛЬКИ JSON без пояснень:
-{"intent": "sales|audit|analyze|unknown", "confidence": 0.0}
+{"intent": "sales|audit|analyze|train|review|fix|push|rollback|design|unknown", "confidence": 0.0}
 
 Приклади:
 - "скільки коштує перегородка 2м?" → {"intent": "sales", "confidence": 0.97}
@@ -33,12 +39,29 @@ _SYSTEM = """Ти — диспетчер AI-платформи. Класифік
 - "зроби аудит сайту" → {"intent": "audit", "confidence": 0.93}
 - "проаналізуй це фото" → {"intent": "analyze", "confidence": 0.95}
 - "привіт" → {"intent": "sales", "confidence": 0.85}
-- "що таке SEO?" → {"intent": "sales", "confidence": 0.72}"""
+- "що таке SEO?" → {"intent": "sales", "confidence": 0.72}
+- "проаналізуй діалоги агента" → {"intent": "train", "confidence": 0.96}
+- "агент відповідає грубо, виправ" → {"intent": "train", "confidence": 0.95}
+- "покращ відповіді бота" → {"intent": "train", "confidence": 0.93}
+- "який останній діалог?" → {"intent": "review", "confidence": 0.94}
+- "покажи статистику розмов" → {"intent": "review", "confidence": 0.97}
+- "скільки ескалацій сьогодні?" → {"intent": "review", "confidence": 0.95}
+- "зроби фікси для etalhome.com" → {"intent": "fix", "confidence": 0.96}
+- "виправ помилки на сайті" → {"intent": "fix", "confidence": 0.93}
+- "згенеруй SEO-фікси" → {"intent": "fix", "confidence": 0.95}
+- "залий фікси на сервер" → {"intent": "push", "confidence": 0.95}
+- "задеплой зміни https://etalhome.com" → {"intent": "push", "confidence": 0.97}
+- "деплой фіксів" → {"intent": "push", "confidence": 0.94}
+- "відкати зміни на сайті" → {"intent": "rollback", "confidence": 0.96}
+- "відновити попередню версію плагіну" → {"intent": "rollback", "confidence": 0.94}
+- "зроби дизайн для сайту" → {"intent": "design", "confidence": 0.95}
+- "редизайн etalhome.com" → {"intent": "design", "confidence": 0.97}
+- "зроби макет лендінгу" → {"intent": "design", "confidence": 0.94}"""
 
 
 @dataclass
 class Intent:
-    name: str           # sales | audit | analyze | unknown
+    name: str           # sales | audit | analyze | train | review | fix | push | rollback | design | unknown
     confidence: float
     extracted_url: str  # URL знайдений у тексті (може бути порожній)
 

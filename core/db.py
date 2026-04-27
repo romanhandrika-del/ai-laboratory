@@ -433,6 +433,16 @@ async def update_fix_status(
     logger.info("[db] Fix #%d статус: %s", fix_id, status)
 
 
+async def get_any_last_fix(client_id: str) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM fix_history WHERE client_id=$1 ORDER BY generated_at DESC LIMIT 1",
+            client_id,
+        )
+    return dict(row) if row else None
+
+
 async def get_last_fix(client_id: str, url: str) -> dict | None:
     pool = _get_pool()
     async with pool.acquire() as conn:
