@@ -70,6 +70,22 @@ ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}
 CREATE INDEX IF NOT EXISTS idx_analysis_client_created ON analysis_history(client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analysis_metadata_gin ON analysis_history USING GIN (metadata);
 
+CREATE TABLE IF NOT EXISTS fix_history (
+    id           SERIAL PRIMARY KEY,
+    client_id    TEXT         NOT NULL DEFAULT 'default',
+    url          TEXT         NOT NULL,
+    fix_count    INTEGER,
+    fix_path     TEXT,
+    backup_path  TEXT,
+    status       TEXT         NOT NULL DEFAULT 'generated',
+    pr_url       TEXT,
+    score_before INTEGER,
+    score_after  INTEGER,
+    generated_at TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_fix_history_client_url ON fix_history(client_id, url, generated_at DESC);
+
 CREATE TABLE IF NOT EXISTS session_state (
     id           SERIAL PRIMARY KEY,
     client_id    VARCHAR(50)  NOT NULL,
@@ -361,6 +377,74 @@ async def clear_session_state(
             "DELETE FROM session_state WHERE client_id=$1 AND user_id=$2 AND source=$3",
             client_id, user_id, source,
         )
+
+
+# ── Analysis history ──────────────────────────────────────────────────────────
+
+# ── Fix history (Neon) ────────────────────────────────────────────────────────
+
+async def save_fix(
+    client_id: str,
+    url: str,
+    fix_count: int,
+    fix_path: str,
+    score_before: int | None = None,
+) -> int:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO fix_history (client_id, url, fix_count, fix_path, score_before)
+               VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+            client_id, url, fix_count, fix_path, score_before,
+        )
+    logger.info("[db] Fix збережено: %s fix_count=%d", url, fix_count)
+    return row["id"]
+
+
+async def update_fix_status(
+    fix_id: int,
+    status: str,
+    pr_url: str | None = None,
+    score_after: int | None = None,
+    backup_path: str | None = None,
+) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE fix_history
+               SET status=$2,
+                   pr_url=COALESCE($3, pr_url),
+                   score_after=COALESCE($4, score_after),
+                   backup_path=COALESCE($5, backup_path),
+                   updated_at=NOW()
+               WHERE id=$1""",
+            fix_id, status, pr_url, score_after, backup_path,
+        )
+    logger.info("[db] Fix #%d статус: %s", fix_id, status)
+
+
+async def get_last_fix(client_id: str, url: str) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT * FROM fix_history
+               WHERE client_id=$1 AND url=$2
+               ORDER BY generated_at DESC LIMIT 1""",
+            client_id, url,
+        )
+    return dict(row) if row else None
+
+
+async def get_applied_fix_paths(client_id: str, url: str) -> list[str]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT fix_path FROM fix_history
+               WHERE client_id=$1 AND url=$2 AND status IN ('pushed', 'verified')
+               ORDER BY generated_at""",
+            client_id, url,
+        )
+    return [r["fix_path"] for r in rows if r["fix_path"]]
 
 
 # ── Analysis history ──────────────────────────────────────────────────────────
