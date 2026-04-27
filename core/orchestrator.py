@@ -1,25 +1,127 @@
 """
-Orchestrator #7 — Router-патерн.
-Haiku класифікує намір → делегує до Sales / Audit / Fix / Design / Train / Review / Multimodal.
-session_state в Neon зберігає multi-turn контекст.
+Orchestrator #7 — Agentic loop.
+Sonnet з 8 інструментами самостійно вирішує що викликати → agentic loop.
+Для менеджера: agentic loop. Для клієнта: Sales Agent.
 """
 
+import json
+import time
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 import anthropic
 from core import db
-from core.intent_classifier import IntentClassifier
 from core.message import AgentMessage, AgentResult
-from core.base_agent import MODEL_HAIKU
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-_URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+', re.IGNORECASE)
+MODEL_SONNET = "claude-sonnet-4-6"
 
 _ORCHESTRATOR_PROMPT_PATH = Path(__file__).parent.parent / "agents" / "orchestrator.md"
+
+_PUSH_TRIGGERS = ("задеплой", "залий", "пушимо", "деплой", "deploy", "/push")
+_ROLLBACK_TRIGGERS = ("відкати", "rollback", "відкат", "скасуй деплой", "/rollback")
+_CONFIRM_WORDS = ("так", "yes", "ок", "ok", "давай", "підтвердж", "звісно")
+
+MAX_TURNS = 8
+
+_MANAGER_TOOLS = [
+    {
+        "name": "run_audit",
+        "description": "SEO-аудит сайту. Повертає score та список проблем.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL сайту (https://...)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "run_fix",
+        "description": "Генерує SEO-фікси для сайту (не деплоїть, тільки готує файл).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL сайту"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "run_push",
+        "description": (
+            "Деплоїть готові SEO-фікси на сайт. ДЕСТРУКТИВНА дія. "
+            "Викликати ТІЛЬКИ після явного підтвердження менеджера "
+            "('задеплой', 'залий', 'пушимо') або відповіді 'так' на твоє запитання."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL сайту"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "run_rollback",
+        "description": (
+            "Відкатує останній деплой. ДЕСТРУКТИВНА дія. "
+            "Викликати ТІЛЬКИ після явного підтвердження менеджера "
+            "('відкати', 'rollback') або відповіді 'так' на твоє запитання."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL сайту"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "run_design",
+        "description": "Генерує дизайн-пакет для сайту або за текстовим брифом.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "input_text": {
+                    "type": "string",
+                    "description": "URL сайту або текстовий бриф",
+                },
+            },
+            "required": ["input_text"],
+        },
+    },
+    {
+        "name": "run_train",
+        "description": "Тренування Sales Agent — аналізує діалоги, записує пропозиції у Sheets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "run_review",
+        "description": "Огляд статистики та останніх розмов Sales Agent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_last_url",
+        "description": "Повертає URL останнього сайту з яким працювали (з БД).",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+]
 
 
 def _load_orchestrator_prompt() -> str:
@@ -28,9 +130,18 @@ def _load_orchestrator_prompt() -> str:
     return "Ти — оркестрант AI Laboratory. Відповідай українською."
 
 
-def _extract_url(text: str) -> str:
-    match = _URL_RE.search(text)
-    return match.group(0) if match else ""
+def _extract_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.append(b.get("text", ""))
+            elif hasattr(b, "text"):
+                parts.append(b.text)
+        return " ".join(filter(None, parts))
+    return ""
 
 
 def _simple_result(content: str, client_id: str, agent_id: str = "orchestrator") -> AgentResult:
@@ -50,9 +161,9 @@ def _simple_result(content: str, client_id: str, agent_id: str = "orchestrator")
 
 class OrchestratorAgent:
     """
-    Центральний Router AI Laboratory.
-    Приймає вільний текст → класифікує Haiku → виконує відповідний агент.
-    Slash-команди (/audit, /fix, /design...) обходять orchestrator через fast-path у bot.py.
+    Центральний агент AI Laboratory.
+    Менеджер: Sonnet agentic loop з 8 інструментами.
+    Клієнт: Sales Agent.
     """
 
     def __init__(self, client_id: str, sales_agent) -> None:
@@ -62,7 +173,6 @@ class OrchestratorAgent:
         from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 
         self.client_id = client_id
-        self._classifier = IntentClassifier()
         self._sales = sales_agent
         self._audit = WebsiteAuditAgent(client_id)
         self._fix = WebsiteFixAgent(client_id)
@@ -77,9 +187,10 @@ class OrchestratorAgent:
         source: str,
         is_manager: bool = False,
     ) -> AgentResult:
-        """Головна точка входу для вільного тексту."""
         try:
-            return await self._route(user_text, user_id, source, is_manager)
+            if is_manager:
+                return await self._run_manager_loop(user_text, user_id, source)
+            return await self._run_sales(user_text, user_id, source)
         except Exception as exc:
             logger.error("[orchestrator] unhandled exception: %s", exc, exc_info=True)
             return _simple_result(
@@ -87,212 +198,152 @@ class OrchestratorAgent:
                 self.client_id,
             )
 
-    async def _route(
+    async def _run_manager_loop(
         self,
         user_text: str,
         user_id: str,
         source: str,
-        is_manager: bool = False,
-    ) -> AgentResult:
-        state = await db.get_session_state(self.client_id, user_id, source)
-        awaiting = state.get("awaiting") if state else None
-
-        # ── Multi-turn: чекаємо URL для pipeline ─────────────────────────────
-        if awaiting == "url_pipeline":
-            url = _extract_url(user_text) or (
-                user_text.strip() if user_text.strip().startswith("http") else ""
-            )
-            if not url and state and state.get("payload", {}).get("suggested_url"):
-                confirm = ("так", "yes", "ок", "ok", "давай", "підтвердж", "звісно")
-                if any(user_text.lower().strip().startswith(w) for w in confirm):
-                    url = state["payload"]["suggested_url"]
-            if url:
-                actions = state.get("payload", {}).get("actions", ["audit", "fix", "push"])
-                await db.clear_session_state(self.client_id, user_id, source)
-                return await self._run_pipeline(actions, url, user_id, source)
-            return _simple_result(
-                'Надішліть URL сайту (https://example.com) або підтвердіть "так" 🔗',
-                self.client_id,
-            )
-
-        # ── Multi-turn: чекаємо URL (audit / fix / push / rollback) ──────────
-        if awaiting in ("url", "url_fix", "url_push", "url_rollback"):
-            url = _extract_url(user_text) or (
-                user_text.strip() if user_text.strip().startswith("http") else ""
-            )
-            # Підтвердження запропонованого URL ("так", "ок", "давай" тощо)
-            if not url and state and state.get("payload", {}).get("suggested_url"):
-                confirm = ("так", "yes", "ок", "ok", "давай", "підтвердж", "звісно")
-                if any(user_text.lower().strip().startswith(w) for w in confirm):
-                    url = state["payload"]["suggested_url"]
-            if url:
-                await db.clear_session_state(self.client_id, user_id, source)
-                if awaiting == "url":
-                    return await self._run_audit(url)
-                elif awaiting == "url_fix":
-                    return await self._run_fix(url)
-                elif awaiting == "url_push":
-                    return await self._run_push(url)
-                elif awaiting == "url_rollback":
-                    return await self._run_rollback(url)
-            return _simple_result(
-                'Надішліть повне посилання (https://example.com) або підтвердіть "так" 🔗',
-                self.client_id,
-            )
-
-        # ── Multi-turn: чекаємо URL або бриф для дизайну ─────────────────────
-        if awaiting == "url_design":
-            url = _extract_url(user_text)
-            if url:
-                await db.clear_session_state(self.client_id, user_id, source)
-                return await self._run_design(url)
-            text = user_text.strip()
-            if len(text) > 5:
-                await db.clear_session_state(self.client_id, user_id, source)
-                return await self._run_design(text)
-            return _simple_result("Надішліть URL сайту або опишіть бриф 🎨", self.client_id)
-
-        # ── Класифікуємо намір ────────────────────────────────────────────────
-        intent = self._classifier.classify(user_text)
-        logger.info(
-            "[orchestrator] user=%s actions=%s conf=%.2f url=%s",
-            user_id, intent.actions, intent.confidence, intent.extracted_url,
-        )
-
-        # ── Pipeline (кілька дій за раз) ──────────────────────────────────────
-        if is_manager and intent.is_pipeline:
-            url = intent.extracted_url
-            if url:
-                return await self._run_pipeline(intent.actions, url, user_id, source)
-            suggested = await self._suggest_last_url()
-            payload: dict = {"actions": intent.actions}
-            if suggested:
-                payload["suggested_url"] = suggested
-                await db.set_session_state(
-                    self.client_id, user_id, source,
-                    active_agent="pipeline", awaiting="url_pipeline", payload=payload,
-                )
-                return _simple_result(
-                    f"▶️ Pipeline: {' → '.join(intent.actions)}\n"
-                    f"Для {suggested} (останній)? Підтвердіть \"так\" або надішліть інший URL 🔗",
-                    self.client_id,
-                )
-            await db.set_session_state(
-                self.client_id, user_id, source,
-                active_agent="pipeline", awaiting="url_pipeline", payload=payload,
-            )
-            return _simple_result(
-                f"▶️ Pipeline: {' → '.join(intent.actions)}\nДля якого сайту? Надішліть URL 🔗",
-                self.client_id,
-            )
-
-        # ── Клієнтські інтенти ────────────────────────────────────────────────
-        if intent.name == "audit":
-            if intent.extracted_url:
-                await db.set_session_state(
-                    self.client_id, user_id, source, active_agent="audit"
-                )
-                return await self._run_audit(intent.extracted_url)
-            await db.set_session_state(
-                self.client_id, user_id, source,
-                active_agent="audit", awaiting="url",
-            )
-            return _simple_result("Надішліть URL сайту для аудиту 🔍", self.client_id)
-
-        elif intent.name == "analyze":
-            return _simple_result(
-                "Для аналізу фото або PDF — надішліть файл разом з командою /analyze 📎",
-                self.client_id,
-            )
-
-        # ── Менеджерські інтенти ──────────────────────────────────────────────
-        elif is_manager and intent.name == "train":
-            return await self._run_train()
-
-        elif is_manager and intent.name == "review":
-            return await self._run_review()
-
-        elif is_manager and intent.name in ("fix", "push", "rollback"):
-            url = intent.extracted_url
-            awaiting_key = f"url_{intent.name}"
-            labels = {"fix": "генерувати фікси", "push": "деплоїти фікси", "rollback": "відкатити зміни"}
-            icons = {"fix": "🔧", "push": "📤", "rollback": "↩️"}
-            if not url:
-                suggested = await self._suggest_last_url()
-                if suggested:
-                    await db.set_session_state(
-                        self.client_id, user_id, source,
-                        active_agent=intent.name, awaiting=awaiting_key,
-                        payload={"suggested_url": suggested},
-                    )
-                    return _simple_result(
-                        f"{icons[intent.name]} {labels[intent.name].capitalize()} для "
-                        f"{suggested} (останній)?\n"
-                        f'Підтвердіть "так" або надішліть інший URL 🔗',
-                        self.client_id,
-                    )
-                await db.set_session_state(
-                    self.client_id, user_id, source,
-                    active_agent=intent.name, awaiting=awaiting_key,
-                )
-                return _simple_result("Для якого сайту? Надішліть URL 🔗", self.client_id)
-            if intent.name == "fix":
-                return await self._run_fix(url)
-            elif intent.name == "push":
-                return await self._run_push(url)
-            else:
-                return await self._run_rollback(url)
-
-        elif is_manager and intent.name == "design":
-            url = intent.extracted_url
-            if url:
-                return await self._run_design(url)
-            clean = re.sub(
-                r"(?i)(зроби\s+дизайн|редизайн|дизайн\s+для|макет\s+для|зроби\s+макет)\s*",
-                "", user_text,
-            ).strip()
-            if len(clean) > 10:
-                return await self._run_design(clean)
-            await db.set_session_state(
-                self.client_id, user_id, source,
-                active_agent="design", awaiting="url_design",
-            )
-            return _simple_result("Надішліть URL сайту або опишіть бриф 🎨", self.client_id)
-
-        # ── Fallback ──────────────────────────────────────────────────────────
-        else:
-            await db.clear_session_state(self.client_id, user_id, source)
-            if is_manager:
-                return await self._run_orchestrator_llm(user_text, user_id, source)
-            return await self._run_sales(user_text, user_id, source)
-
-    # ── Адаптери ──────────────────────────────────────────────────────────────
-
-    async def _run_orchestrator_llm(
-        self, text: str, user_id: str = "", source: str = ""
     ) -> AgentResult:
         system_prompt = _load_orchestrator_prompt()
-        history: list[dict] = []
-        if user_id and source:
-            raw = await db.load_history(self.client_id, user_id, source, limit=6)
-            history = [{"role": m["role"], "content": m["content"]} for m in raw]
-        messages = history + [{"role": "user", "content": text}]
-        try:
+        raw_history = await db.load_history(self.client_id, user_id, source, limit=6)
+        messages = [{"role": m["role"], "content": m["content"]} for m in raw_history]
+        messages.append({"role": "user", "content": user_text})
+
+        loop_start = time.monotonic()
+        all_tool_names: list[str] = []
+
+        for turn in range(MAX_TURNS):
             response = self._llm.messages.create(
-                model=MODEL_HAIKU,
-                max_tokens=512,
+                model=MODEL_SONNET,
+                max_tokens=1024,
                 system=[{
                     "type": "text",
                     "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }],
+                tools=_MANAGER_TOOLS,
                 messages=messages,
             )
-            content = response.content[0].text
-        except Exception as exc:
-            logger.error("[orchestrator] LLM fallback error: %s", exc)
-            content = "Вибачте, виникла помилка. Спробуйте ще раз."
-        return _simple_result(content, self.client_id, agent_id="orchestrator")
+
+            if response.stop_reason == "end_turn":
+                text = next(
+                    (b.text for b in response.content if hasattr(b, "text")), ""
+                )
+                logger.info(
+                    "[orchestrator] DONE user=%s turns=%d stop=%s tools=%s total=%.1fs",
+                    user_id, turn + 1, response.stop_reason,
+                    all_tool_names, time.monotonic() - loop_start,
+                )
+                return _simple_result(text, self.client_id)
+
+            if response.stop_reason != "tool_use":
+                break
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+
+                name = block.name
+                args = block.input
+                all_tool_names.append(name)
+
+                t0 = time.monotonic()
+                result_text = await self._execute_tool(name, args, user_text, messages)
+                elapsed = time.monotonic() - t0
+
+                logger.info(
+                    "[orchestrator] manager_loop user=%s turn=%d/%d tool=%s args=%s → %d chars, %.1fs",
+                    user_id, turn + 1, MAX_TURNS, name,
+                    json.dumps(args)[:120], len(result_text), elapsed,
+                )
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        logger.warning("[orchestrator] loop exhausted user=%s", user_id)
+        return _simple_result(
+            "Не вдалося завершити задачу. Спробуйте ще раз.",
+            self.client_id,
+        )
+
+    async def _execute_tool(
+        self,
+        name: str,
+        args: dict,
+        user_text: str,
+        messages: list,
+    ) -> str:
+        try:
+            if name == "run_audit":
+                r = await self._run_audit(args.get("url", ""))
+                return r.content
+            elif name == "run_fix":
+                r = await self._run_fix(args.get("url", ""))
+                return r.content
+            elif name == "run_push":
+                if not self._is_destructive_confirmed(user_text, "push", messages):
+                    return "⚠️ Для деплою потрібне явне підтвердження: скажіть 'задеплой' або 'залий'."
+                r = await self._run_push(args.get("url", ""))
+                return r.content
+            elif name == "run_rollback":
+                if not self._is_destructive_confirmed(user_text, "rollback", messages):
+                    return "⚠️ Для відкату потрібне явне підтвердження: скажіть 'відкати'."
+                r = await self._run_rollback(args.get("url", ""))
+                return r.content
+            elif name == "run_design":
+                r = await self._run_design(args.get("input_text", ""))
+                return r.content
+            elif name == "run_train":
+                r = await self._run_train()
+                return r.content
+            elif name == "run_review":
+                r = await self._run_review()
+                return r.content
+            elif name == "get_last_url":
+                url = await self._suggest_last_url()
+                return url if url else "URL не знайдено в БД."
+            else:
+                return f"Невідомий інструмент: {name}"
+        except Exception as e:
+            logger.error("[orchestrator] _execute_tool name=%s error: %s", name, e)
+            return f"❌ Помилка {name}: {e}"
+
+    def _is_destructive_confirmed(
+        self, user_text: str, action: str, messages: list
+    ) -> bool:
+        text_lower = user_text.lower()
+        triggers = _PUSH_TRIGGERS if action == "push" else _ROLLBACK_TRIGGERS
+
+        if any(kw in text_lower for kw in triggers):
+            return True
+
+        # Перевіряємо, чи user підтверджує попереднє запитання асистента
+        if any(w in text_lower for w in _CONFIRM_WORDS):
+            push_kws = ("деплої", "push", "залит", "залий", "задеплоїти")
+            rollback_kws = ("відкат", "rollback")
+            question_kws = push_kws if action == "push" else rollback_kws
+
+            for msg in reversed(messages):
+                if msg.get("role") != "assistant":
+                    continue
+                content_text = _extract_text_from_content(msg.get("content", ""))
+                if not content_text.strip():
+                    continue  # пропускаємо tool-only блоки
+                if any(kw in content_text.lower() for kw in question_kws):
+                    return True
+                break
+
+        return False
+
+    # ── Адаптери ──────────────────────────────────────────────────────────────
 
     async def _run_sales(self, text: str, user_id: str, source: str) -> AgentResult:
         history = await db.load_history(self.client_id, str(user_id), source, limit=8)
@@ -320,7 +371,7 @@ class OrchestratorAgent:
             trace_id="",
             agent_id="website-audit-v1",
             client_id=self.client_id,
-            model_used=MODEL_HAIKU,
+            model_used=MODEL_SONNET,
             input_tokens=0,
             output_tokens=0,
             metadata={
@@ -328,70 +379,6 @@ class OrchestratorAgent:
                 "report_md_path": str(result.get("report_md_path", "")),
             },
         )
-
-    async def _run_train(self) -> AgentResult:
-        from agents.sales.trainer import run_training
-        try:
-            result = await run_training(self.client_id, 30, only_low=False)
-            if result.get("error"):
-                return _simple_result(
-                    f"❌ Помилка тренування: {result['error']}", self.client_id, "trainer"
-                )
-            suggestions = result.get("suggestions", [])
-            written = result.get("written", 0)
-            if not suggestions:
-                return _simple_result(
-                    result.get("msg", "✅ Все добре — пропозицій немає."),
-                    self.client_id, "trainer",
-                )
-            lines = [f"🧠 Тренування завершено\nЗаписано у Sheets: {written} пропозицій\n"]
-            for s in suggestions[:8]:
-                prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
-                lines.append(
-                    f"{prio} {s.get('type', '')} — {s.get('priority', '')}\n"
-                    f"Проблема: {s.get('problem', '')}\n"
-                    f"Пропозиція: {s.get('suggestion', '')}\n"
-                )
-            if len(suggestions) > 8:
-                lines.append(f"...та ще {len(suggestions) - 8} пропозицій у Sheets")
-            text = "\n".join(lines)
-            if len(text) > 4000:
-                text = text[:3950] + "\n...обрізано"
-            return _simple_result(text, self.client_id, "trainer")
-        except Exception as e:
-            logger.error("[orchestrator] _run_train error: %s", e)
-            return _simple_result(f"❌ Помилка тренування: {e}", self.client_id, "trainer")
-
-    async def _run_review(self) -> AgentResult:
-        try:
-            stats = await db.get_dialogs_stats(self.client_id)
-            rows = await db.get_dialogs_review(self.client_id, limit=10, only_low=False)
-            header = (
-                f"📊 Sales Agent — огляд розмов\n"
-                f"Всього: {stats.get('total', 0)} | "
-                f"Avg confidence: {stats.get('avg_confidence', 0)} | "
-                f"Ескалацій: {stats.get('escalations', 0)} | "
-                f"Витрати: ${stats.get('total_cost', 0)}\n"
-                + "─" * 30 + "\n"
-            )
-            if not rows:
-                return _simple_result(header + "Розмов поки немає.", self.client_id, "review")
-            lines = [header]
-            for r in rows:
-                flag = "🔴" if r["needs_human"] else ("🟡" if r["confidence"] < 0.75 else "🟢")
-                ts = r["created_at"][:16].replace("T", " ")
-                lines.append(
-                    f"{flag} {ts} | conf: {r['confidence']:.2f}\n"
-                    f"👤 {r['user_msg'][:80]}\n"
-                    f"🤖 {r['bot_reply'][:120]}\n"
-                )
-            text = "\n".join(lines)
-            if len(text) > 4000:
-                text = text[:3950] + "\n...обрізано"
-            return _simple_result(text, self.client_id, "review")
-        except Exception as e:
-            logger.error("[orchestrator] _run_review error: %s", e)
-            return _simple_result(f"❌ Помилка: {e}", self.client_id, "review")
 
     async def _run_fix(self, url: str) -> AgentResult:
         if not url.startswith(("http://", "https://")):
@@ -459,82 +446,71 @@ class OrchestratorAgent:
             logger.error("[orchestrator] _run_design error: %s", e)
             return _simple_result(f"❌ Помилка: {e}", self.client_id, "web-design-v1")
 
-    async def _run_pipeline(
-        self,
-        actions: list[str],
-        url: str,
-        user_id: str = "",
-        source: str = "",
-    ) -> AgentResult:
-        """Виконує послідовність дій над одним URL.
-        Зупиняється перед push і чекає підтвердження від менеджера.
-        """
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        icons = {"audit": "🔍", "fix": "🔧", "push": "📤", "rollback": "↩️", "design": "🎨"}
-        pre_push = [a for a in actions if a != "push"]
-        has_push = "push" in actions
-        total = len(pre_push) + (1 if has_push else 0)
-        lines = [f"▶️ Pipeline для {url}: {' → '.join(actions)}\n"]
-        step = 0
-
-        for action in pre_push:
-            step += 1
-            icon = icons.get(action, "⚙️")
-            lines.append(f"{icon} Крок {step}/{total} — {action}...")
-            try:
-                if action == "audit":
-                    r = await self._audit.audit(url)
-                    if r.get("error"):
-                        lines.append(f"❌ {r['error']}")
-                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
-                    score = r.get("score", "—")
-                    first = (r.get("summary_text", "") or "").splitlines()[0] or "Аудит завершено."
-                    lines.append(f"✅ score={score} | {first}")
-                elif action == "fix":
-                    r = await self._fix.fix(url)
-                    if r.get("error"):
-                        lines.append(f"❌ {r['error']}")
-                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
-                    first = (r.get("summary_text", "") or "").splitlines()[0] or "Фікси готові."
-                    lines.append(f"✅ {first}")
-                elif action == "rollback":
-                    r = await self._fix.rollback(url)
-                    if r.get("error"):
-                        lines.append(f"❌ {r['error']}")
-                        return _simple_result("\n".join(lines), self.client_id, "pipeline")
-                    lines.append(f"✅ {r.get('summary_text', 'Відкат виконано.')}")
-                elif action == "design":
-                    result = await self._run_design(url)
-                    lines.append(f"✅ {result.content.splitlines()[0]}")
-                else:
-                    lines.append(f"⚠️ Невідома дія: {action}")
-            except Exception as e:
-                logger.error("[pipeline] action=%s error: %s", action, e)
-                lines.append(f"❌ Помилка: {e}")
-                return _simple_result("\n".join(lines), self.client_id, "pipeline")
-
-        if has_push:
-            # Зберігаємо стан і чекаємо підтвердження
-            if user_id and source:
-                await db.set_session_state(
-                    self.client_id, user_id, source,
-                    active_agent="pipeline", awaiting="url_push",
-                    payload={"suggested_url": url},
+    async def _run_train(self) -> AgentResult:
+        from agents.sales.trainer import run_training
+        try:
+            result = await run_training(self.client_id, 30, only_low=False)
+            if result.get("error"):
+                return _simple_result(
+                    f"❌ Помилка тренування: {result['error']}", self.client_id, "trainer"
                 )
-            lines.append(
-                f"\n📤 Крок {total}/{total} — push готовий.\n"
-                f"Деплоїти фікси на {url}?\n"
-                f'Підтвердіть "так" або /push 🚀'
-            )
-            return _simple_result("\n".join(lines), self.client_id, "pipeline")
+            suggestions = result.get("suggestions", [])
+            written = result.get("written", 0)
+            if not suggestions:
+                return _simple_result(
+                    result.get("msg", "✅ Все добре — пропозицій немає."),
+                    self.client_id, "trainer",
+                )
+            lines = [f"🧠 Тренування завершено\nЗаписано у Sheets: {written} пропозицій\n"]
+            for s in suggestions[:8]:
+                prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
+                lines.append(
+                    f"{prio} {s.get('type', '')} — {s.get('priority', '')}\n"
+                    f"Проблема: {s.get('problem', '')}\n"
+                    f"Пропозиція: {s.get('suggestion', '')}\n"
+                )
+            if len(suggestions) > 8:
+                lines.append(f"...та ще {len(suggestions) - 8} пропозицій у Sheets")
+            text = "\n".join(lines)
+            if len(text) > 4000:
+                text = text[:3950] + "\n...обрізано"
+            return _simple_result(text, self.client_id, "trainer")
+        except Exception as e:
+            logger.error("[orchestrator] _run_train error: %s", e)
+            return _simple_result(f"❌ Помилка тренування: {e}", self.client_id, "trainer")
 
-        lines.append("\n✅ Pipeline завершено.")
-        return _simple_result("\n".join(lines), self.client_id, "pipeline")
+    async def _run_review(self) -> AgentResult:
+        try:
+            stats = await db.get_dialogs_stats(self.client_id)
+            rows = await db.get_dialogs_review(self.client_id, limit=10, only_low=False)
+            header = (
+                f"📊 Sales Agent — огляд розмов\n"
+                f"Всього: {stats.get('total', 0)} | "
+                f"Avg confidence: {stats.get('avg_confidence', 0)} | "
+                f"Ескалацій: {stats.get('escalations', 0)} | "
+                f"Витрати: ${stats.get('total_cost', 0)}\n"
+                + "─" * 30 + "\n"
+            )
+            if not rows:
+                return _simple_result(header + "Розмов поки немає.", self.client_id, "review")
+            lines = [header]
+            for r in rows:
+                flag = "🔴" if r["needs_human"] else ("🟡" if r["confidence"] < 0.75 else "🟢")
+                ts = r["created_at"][:16].replace("T", " ")
+                lines.append(
+                    f"{flag} {ts} | conf: {r['confidence']:.2f}\n"
+                    f"👤 {r['user_msg'][:80]}\n"
+                    f"🤖 {r['bot_reply'][:120]}\n"
+                )
+            text = "\n".join(lines)
+            if len(text) > 4000:
+                text = text[:3950] + "\n...обрізано"
+            return _simple_result(text, self.client_id, "review")
+        except Exception as e:
+            logger.error("[orchestrator] _run_review error: %s", e)
+            return _simple_result(f"❌ Помилка: {e}", self.client_id, "review")
 
     async def _suggest_last_url(self) -> str:
-        """Повертає домен останнього fix з БД для smart URL suggestion."""
         try:
             row = await db.get_any_last_fix(self.client_id)
             if row and row.get("url"):
