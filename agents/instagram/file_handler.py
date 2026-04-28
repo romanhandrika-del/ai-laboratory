@@ -97,7 +97,7 @@ async def handle_image_bytes(image_bytes: bytes, media_type: str, conversation_h
         "Текст розпізнаний OCR з фото: (текст не розпізнано — аналізуй тільки зображення)"
     )
 
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({
         "role": "user",
         "content": [
@@ -147,7 +147,7 @@ async def handle_pdf_bytes(pdf_bytes: bytes, conversation_history: list, system_
     if not text:
         return "Не вдалося прочитати PDF. Будь ласка, надішліть файл у форматі JPG або PNG, або опишіть розміри текстом."
 
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({
         "role": "user",
         "content": f"Клієнт надіслав технічне завдання (PDF):\n\n{text[:4000]}"
@@ -243,7 +243,7 @@ async def handle_audio_bytes(audio_bytes: bytes, mime_hint: str, conversation_hi
     logger.info("Голосове розпізнано: %s", text[:80])
 
     # Обробляємо розпізнаний текст як звичайне повідомлення через Claude
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({"role": "user", "content": f"[Голосове повідомлення]: {text}"})
 
     for attempt in range(3):
