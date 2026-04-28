@@ -15,6 +15,17 @@ from core import db
 from core.message import AgentMessage, AgentResult
 from core.logger import get_logger
 
+# ── Prompt cache ──────────────────────────────────────────────────────────────
+_CACHED_PROMPT: str | None = None
+_CACHE_TS: float = 0.0
+_CACHE_TTL: int = 600  # 10 хвилин
+
+
+def invalidate_orchestrator_prompt_cache() -> None:
+    global _CACHED_PROMPT, _CACHE_TS
+    _CACHED_PROMPT = None
+    _CACHE_TS = 0.0
+
 logger = get_logger(__name__)
 
 MODEL_SONNET = "claude-sonnet-4-6"
@@ -130,6 +141,22 @@ def _load_orchestrator_prompt() -> str:
     return "Ти — оркестрант AI Laboratory. Відповідай українською."
 
 
+async def _load_orchestrator_prompt_cached(client_id: str) -> str:
+    """DB-first with 10-min cache; falls back to file."""
+    global _CACHED_PROMPT, _CACHE_TS
+    if _CACHED_PROMPT and (time.monotonic() - _CACHE_TS) < _CACHE_TTL:
+        return _CACHED_PROMPT
+    try:
+        prompt = await db.get_agent_prompt(client_id, "orchestrator")
+        if prompt:
+            _CACHED_PROMPT = prompt
+            _CACHE_TS = time.monotonic()
+            return prompt
+    except Exception as e:
+        logger.warning("[orchestrator] DB prompt lookup failed: %s", e)
+    return _load_orchestrator_prompt()
+
+
 def _extract_text_from_content(content) -> str:
     if isinstance(content, str):
         return content
@@ -204,7 +231,7 @@ class OrchestratorAgent:
         user_id: str,
         source: str,
     ) -> AgentResult:
-        system_prompt = _load_orchestrator_prompt()
+        system_prompt = await _load_orchestrator_prompt_cached(self.client_id)
         raw_history = await db.load_history(self.client_id, user_id, source, limit=6)
         messages = [{"role": m["role"], "content": m["content"]} for m in raw_history]
         messages.append({"role": "user", "content": user_text})

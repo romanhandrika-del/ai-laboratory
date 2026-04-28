@@ -107,11 +107,38 @@ CREATE TABLE IF NOT EXISTS session_state (
     updated_at   TIMESTAMPTZ  DEFAULT NOW(),
     UNIQUE (client_id, user_id, source)
 );
+
+CREATE TABLE IF NOT EXISTS agent_prompts (
+    id                   SERIAL PRIMARY KEY,
+    client_id            TEXT NOT NULL,
+    agent_id             TEXT NOT NULL,
+    prompt_text          TEXT NOT NULL,
+    version              INT  NOT NULL DEFAULT 1,
+    previous_prompt_text TEXT,
+    previous_version     INT,
+    updated_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_by           TEXT DEFAULT 'system',
+    UNIQUE(client_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS orchestrator_pending_review (
+    id               SERIAL PRIMARY KEY,
+    client_id        TEXT NOT NULL,
+    issues_summary   TEXT NOT NULL,
+    change_log       TEXT NOT NULL DEFAULT '[]',
+    new_prompt       TEXT NOT NULL,
+    dialogs_analyzed INT,
+    dialogs_from     TIMESTAMPTZ,
+    dialogs_to       TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(client_id)
+);
 """
 
 
 async def init() -> None:
     global _pool
+    from pathlib import Path
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL не знайдено в env")
@@ -123,6 +150,22 @@ async def init() -> None:
     )
     async with _pool.acquire() as conn:
         await conn.execute(_DDL)
+        # Auto-seed orchestrator.md into agent_prompts if not yet seeded
+        client_id = os.getenv("DEFAULT_CLIENT_ID", "etalhome")
+        exists = await conn.fetchval(
+            "SELECT 1 FROM agent_prompts WHERE client_id=$1 AND agent_id='orchestrator' LIMIT 1",
+            client_id,
+        )
+        if not exists:
+            prompt_path = Path(__file__).parent.parent / "agents" / "orchestrator.md"
+            if prompt_path.exists():
+                prompt = prompt_path.read_text(encoding="utf-8").strip()
+                await conn.execute(
+                    "INSERT INTO agent_prompts (client_id, agent_id, prompt_text, version, updated_by) "
+                    "VALUES ($1, 'orchestrator', $2, 1, 'seed')",
+                    client_id, prompt,
+                )
+                logger.info("[db] Auto-seeded agents/orchestrator.md → agent_prompts v1")
     logger.info("[db] pool ready")
 
 
@@ -386,6 +429,109 @@ async def clear_session_state(
         await conn.execute(
             "DELETE FROM session_state WHERE client_id=$1 AND user_id=$2 AND source=$3",
             client_id, user_id, source,
+        )
+
+
+# ── Agent prompts (versioned, trainer-managed) ───────────────────────────────
+
+async def get_agent_prompt(client_id: str, agent_id: str) -> str | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT prompt_text FROM agent_prompts WHERE client_id=$1 AND agent_id=$2",
+            client_id, agent_id,
+        )
+    return row["prompt_text"] if row else None
+
+
+async def save_agent_prompt(client_id: str, agent_id: str, prompt_text: str, updated_by: str) -> int:
+    """UPSERT with versioning. Returns new version number."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO agent_prompts (client_id, agent_id, prompt_text, version, updated_by)
+               VALUES ($1, $2, $3, 1, $4)
+               ON CONFLICT (client_id, agent_id) DO UPDATE SET
+                 previous_prompt_text = agent_prompts.prompt_text,
+                 previous_version     = agent_prompts.version,
+                 prompt_text          = EXCLUDED.prompt_text,
+                 version              = agent_prompts.version + 1,
+                 updated_at           = NOW(),
+                 updated_by           = EXCLUDED.updated_by
+               RETURNING version""",
+            client_id, agent_id, prompt_text, updated_by,
+        )
+    return row["version"]
+
+
+async def rollback_agent_prompt(client_id: str, agent_id: str) -> int | None:
+    """Swap prompt_text ↔ previous_prompt_text. Returns restored version or None."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE agent_prompts SET
+                 prompt_text          = previous_prompt_text,
+                 version              = previous_version,
+                 previous_prompt_text = NULL,
+                 previous_version     = NULL,
+                 updated_at           = NOW(),
+                 updated_by           = 'rollback'
+               WHERE client_id=$1 AND agent_id=$2 AND previous_prompt_text IS NOT NULL
+               RETURNING version""",
+            client_id, agent_id,
+        )
+    return row["version"] if row else None
+
+
+# ── Orchestrator pending review ───────────────────────────────────────────────
+
+async def save_pending_review(
+    client_id: str,
+    issues: str,
+    new_prompt: str,
+    change_log: str,
+    dialogs_count: int,
+    dialogs_from: datetime,
+    dialogs_to: datetime,
+) -> int:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO orchestrator_pending_review
+                 (client_id, issues_summary, new_prompt, change_log,
+                  dialogs_analyzed, dialogs_from, dialogs_to)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (client_id) DO UPDATE SET
+                 issues_summary   = EXCLUDED.issues_summary,
+                 new_prompt       = EXCLUDED.new_prompt,
+                 change_log       = EXCLUDED.change_log,
+                 dialogs_analyzed = EXCLUDED.dialogs_analyzed,
+                 dialogs_from     = EXCLUDED.dialogs_from,
+                 dialogs_to       = EXCLUDED.dialogs_to,
+                 created_at       = NOW()
+               RETURNING id""",
+            client_id, issues, new_prompt, change_log,
+            dialogs_count, dialogs_from, dialogs_to,
+        )
+    return row["id"]
+
+
+async def get_pending_review(client_id: str) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM orchestrator_pending_review WHERE client_id=$1",
+            client_id,
+        )
+    return dict(row) if row else None
+
+
+async def clear_pending_review(client_id: str) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM orchestrator_pending_review WHERE client_id=$1",
+            client_id,
         )
 
 

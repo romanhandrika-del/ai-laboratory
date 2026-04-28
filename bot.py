@@ -108,6 +108,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_manager = bool(MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID))
 
+    # Trainer approval: перехоплюємо "так/ні/diff" якщо є pending review
+    if is_manager:
+        pending = await db.get_pending_review(sales_agent.client_id)
+        if pending:
+            from core.orchestrator import invalidate_orchestrator_prompt_cache
+            cmd = user_text.strip().lower()
+            if cmd in ("так", "yes", "ок", "затверди"):
+                v = await db.save_agent_prompt(
+                    sales_agent.client_id, "orchestrator",
+                    pending["new_prompt"], "auto-trainer",
+                )
+                await db.clear_pending_review(sales_agent.client_id)
+                invalidate_orchestrator_prompt_cache()
+                await update.message.reply_text(f"✅ Промпт оновлено до версії {v}")
+                return
+            elif cmd in ("ні", "no", "пропусти", "skip"):
+                await db.clear_pending_review(sales_agent.client_id)
+                await update.message.reply_text("Пропущено. Промпт без змін.")
+                return
+            elif cmd in ("diff", "деталі"):
+                try:
+                    issues_list = json.loads(pending["issues_summary"])
+                    cl_list = json.loads(pending["change_log"])
+                except Exception:
+                    issues_list = [pending["issues_summary"]]
+                    cl_list = []
+                current = await db.get_agent_prompt(sales_agent.client_id, "orchestrator") or ""
+                issues_text = "\n".join(f"• {i}" for i in issues_list[:5])
+                cl_text = "\n".join(f"• {c}" for c in cl_list[:5])
+                msg = (
+                    f"<b>Знайдені проблеми:</b>\n{issues_text}\n\n"
+                    f"<b>Зміни:</b>\n{cl_text}\n\n"
+                    f"<b>Було (початок):</b>\n<code>{current[:400]}</code>\n\n"
+                    f"<b>Стане (початок):</b>\n<code>{pending['new_prompt'][:400]}</code>"
+                )
+                await update.message.reply_html(msg)
+                return
+
     if _is_heavy_request(user_text, is_manager):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -699,6 +737,60 @@ async def _run_aiohttp(tg_app, port: int) -> None:
     await asyncio.Event().wait()
 
 
+async def daily_trainer_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """08:00 Kyiv (05:00 UTC): analyze manager dialogs, propose improved orchestrator prompt."""
+    if not MANAGER_TELEGRAM_ID:
+        return
+    try:
+        from agents.orchestrator_trainer.analyzer import analyze
+        r = await analyze(sales_agent.client_id, hours=24)
+        if r.get("skip"):
+            logger.info("[trainer] skip: %s", r.get("reason"))
+            return
+        issues_text = "\n".join(f"• {i}" for i in r["issues"][:5])
+        change_text = "\n".join(f"• {c}" for c in r.get("change_log", [])[:5])
+        text = (
+            f"🌅 <b>Ранковий аудит оркестранта</b>\n"
+            f"Проаналізовано: {r['dialogs_count']} повідомлень\n\n"
+            f"<b>Знайдено проблем: {len(r['issues'])}</b>\n{issues_text}\n\n"
+            f"<b>Зміни:</b>\n{change_text}\n\n"
+            f"Затвердити нову версію промпту? <b>так / ні / diff</b>"
+        )
+        await context.bot.send_message(
+            chat_id=MANAGER_TELEGRAM_ID, text=text, parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error("[daily_trainer] failed: %s", e, exc_info=True)
+
+
+async def handle_test_trainer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /test_trainer — вручну запускає аналіз оркестранта."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    await update.message.reply_text("⏳ Запускаю аналіз діалогів оркестранта...")
+    await daily_trainer_job(context)
+
+
+async def handle_prompt_rollback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /prompt_rollback — відкочує промпт оркестранта до попередньої версії."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    from core.orchestrator import invalidate_orchestrator_prompt_cache
+    v = await db.rollback_agent_prompt(sales_agent.client_id, "orchestrator")
+    if v is None:
+        await update.message.reply_text("Попередня версія відсутня — відкотити нема куди.")
+        return
+    invalidate_orchestrator_prompt_cache()
+    await update.message.reply_text(f"↩️ Промпт оркестранта відкочено до версії {v}")
+
+
+async def handle_ack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /ack — підтвердження перегляду (використовується в approval flow)."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    await update.message.reply_text("ℹ️ Щоб затвердити новий промпт, відповідайте 'так' або 'ні' на звіт тренера.")
+
+
 async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Автоматичний запуск тренування щодня о 9:00 Київ (06:00 UTC)."""
     if not MANAGER_TELEGRAM_ID:
@@ -739,6 +831,8 @@ def _build_tg_app(token: str):
     tg_app = ApplicationBuilder().token(token).build()
     from datetime import time as dt_time
     tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0))
+    # Daily orchestrator trainer: 08:00 Kyiv = 05:00 UTC
+    tg_app.job_queue.run_daily(daily_trainer_job, time=dt_time(hour=5, minute=0))
     tg_app.add_handler(CommandHandler("start", handle_start))
     tg_app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
     tg_app.add_handler(CommandHandler("review", handle_review))
@@ -749,6 +843,9 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("design", handle_design))
     tg_app.add_handler(CommandHandler("train", handle_train))
     tg_app.add_handler(CommandHandler("analyze", handle_analyze))
+    tg_app.add_handler(CommandHandler("test_trainer", handle_test_trainer))
+    tg_app.add_handler(CommandHandler("prompt_rollback", handle_prompt_rollback))
+    tg_app.add_handler(CommandHandler("ack", handle_ack))
     tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Фото або документ з caption /analyze → Multimodal Analyst
     tg_app.add_handler(MessageHandler(
