@@ -373,13 +373,19 @@ class OrchestratorAgent:
     # ── Адаптери ──────────────────────────────────────────────────────────────
 
     async def _run_sales(self, text: str, user_id: str, source: str) -> AgentResult:
+        import asyncio
+        from agents.sales.memory import should_update_summary, update_summary
         history = await db.load_history(self.client_id, str(user_id), source, limit=8)
-        return self._sales.run(AgentMessage(
+        summary = await db.get_summary(self.client_id, str(user_id), source)
+        result = self._sales.run(AgentMessage(
             content=text,
             client_id=self.client_id,
             context=history,
-            metadata={"user_id": user_id, "source": source},
+            metadata={"user_id": user_id, "source": source, "client_memory": summary},
         ))
+        if await should_update_summary(self.client_id, str(user_id), source):
+            asyncio.create_task(update_summary(self.client_id, str(user_id), source))
+        return result
 
     async def _run_audit(self, url: str) -> AgentResult:
         if not url.startswith(("http://", "https://")):

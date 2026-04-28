@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS dialogs (
     UNIQUE (client_id, user_id, source)
 );
 CREATE INDEX IF NOT EXISTS idx_dialogs_messages_gin ON dialogs USING GIN (messages);
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary TEXT;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMPTZ;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary_msg_count INT DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS trainer_suggestions (
     id          SERIAL PRIMARY KEY,
@@ -220,8 +223,8 @@ async def save_message(
             else:
                 messages = list(row["messages"])
                 messages.append(new_msg)
-                if len(messages) > 50:
-                    messages = messages[-50:]
+                if len(messages) > 200:
+                    messages = messages[-200:]
             await conn.execute(
                 """INSERT INTO dialogs (client_id, user_id, source, messages)
                    VALUES ($1, $2, $3, $4)
@@ -247,6 +250,57 @@ async def load_history(
     if row is None:
         return []
     return list(row["messages"])[-limit:]
+
+
+async def get_all_messages(client_id: str, user_id: str, source: str) -> list[dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT messages FROM dialogs WHERE client_id=$1 AND user_id=$2 AND source=$3",
+            client_id, user_id, source,
+        )
+    return list(row["messages"]) if row else []
+
+
+async def get_summary(client_id: str, user_id: str, source: str) -> str | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT summary FROM dialogs WHERE client_id=$1 AND user_id=$2 AND source=$3",
+            client_id, user_id, source,
+        )
+    return row["summary"] if row else None
+
+
+async def save_summary(
+    client_id: str,
+    user_id: str,
+    source: str,
+    summary: str,
+    msg_count: int,
+) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE dialogs
+               SET summary=$4, summary_updated_at=NOW(), summary_msg_count=$5
+               WHERE client_id=$1 AND user_id=$2 AND source=$3""",
+            client_id, user_id, source, summary, msg_count,
+        )
+
+
+async def get_summary_msg_count(client_id: str, user_id: str, source: str) -> tuple[int, int]:
+    """Повертає (total_messages, summary_msg_count) для рядка dialogs."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT jsonb_array_length(messages) AS total, COALESCE(summary_msg_count, 0) AS smc "
+            "FROM dialogs WHERE client_id=$1 AND user_id=$2 AND source=$3",
+            client_id, user_id, source,
+        )
+    if row is None:
+        return 0, 0
+    return row["total"], row["smc"]
 
 
 # ── Review / Stats ────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ Webhook payload (від Sendrules):
 Header: X-Webhook-Secret: <WEBHOOK_SECRET>
 """
 
+import asyncio
 import os
 from core import db
 from core.logger import get_logger
@@ -37,14 +38,16 @@ async def handle_message(
     Обробляє вхідне DM від Sendrules.
     Повертає reply рядок для відправки назад клієнту.
     """
+    from agents.sales.memory import should_update_summary, update_summary
     client_id = sales_agent.client_id
     context = await db.load_history(client_id, user_id, source, limit=MAX_HISTORY)
+    summary = await db.get_summary(client_id, user_id, source)
 
     result = sales_agent.run(AgentMessage(
         content=message,
         client_id=client_id,
         context=context,
-        metadata={"source": source, "user_id": user_id, "name": name},
+        metadata={"source": source, "user_id": user_id, "name": name, "client_memory": summary},
     ))
 
     await db.save_message(client_id, user_id, source, "user", message)
@@ -59,4 +62,6 @@ async def handle_message(
     )
 
     logger.info("[%s] %s conf=%.2f needs_human=%s", source, name, result.confidence, result.needs_human)
+    if await should_update_summary(client_id, user_id, source):
+        asyncio.create_task(update_summary(client_id, user_id, source))
     return result.content

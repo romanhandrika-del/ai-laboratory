@@ -54,13 +54,24 @@ class BaseAgent(ABC):
     def run(self, message: AgentMessage) -> AgentResult:
         pass
 
-    def _call_api(self, message: AgentMessage, model: Optional[str] = None) -> AgentResult:
+    def _call_api(
+        self,
+        message: AgentMessage,
+        model: Optional[str] = None,
+        system_extra: Optional[str] = None,
+    ) -> AgentResult:
         model = model or self.model
         context = message.context[-SLIDING_WINDOW:]
 
         # API приймає тільки role і content — стрипаємо зайві поля (ts, meta тощо)
         messages = [{"role": m["role"], "content": m["content"]} for m in context]
         messages.append({"role": "user", "content": message.content})
+
+        system_blocks: list[dict] = [
+            {"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}},
+        ]
+        if system_extra:
+            system_blocks.append({"type": "text", "text": system_extra})
 
         for attempt, delay in enumerate([0] + RETRY_DELAYS):
             if delay:
@@ -69,13 +80,7 @@ class BaseAgent(ABC):
                 response = self._client.messages.create(
                     model=model,
                     max_tokens=self.max_tokens,
-                    system=[
-                        {
-                            "type": "text",
-                            "text": self.system_prompt,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
+                    system=system_blocks,
                     messages=messages,
                 )
                 content = response.content[0].text
