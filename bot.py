@@ -685,8 +685,12 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     file_url = body.get("file_url")
     file_type = body.get("file_type")
 
+    # Sendrules bug: file_url дорівнює тексту message або не є URL — скидаємо
+    if file_url and (file_url == message or not file_url.startswith("http")):
+        file_url = None
+
     # Fallback: якщо Sendrules не поклав URL у file_url — шукаємо CDN-URL в message
-    if not (file_url and file_url.startswith("http")) and message:
+    if not file_url and message:
         detected = _extract_image_url(message)
         if detected:
             file_url = detected
@@ -702,8 +706,7 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
 
     try:
         # Якщо прийшло фото/PDF — обробляємо через Claude Vision + Google OCR
-        # file_url може прийти як {{last_message}} — перевіряємо що це справжній URL
-        if file_url and file_url.startswith("http") and file_type != "text":
+        if file_url and file_url.startswith("http"):
             from agents.instagram.file_handler import handle_file_url
             from agents.instagram.instagram_agent import MAX_HISTORY
             context = await db.load_history(sales_agent.client_id, user_id, source, limit=MAX_HISTORY)
