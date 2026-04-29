@@ -187,10 +187,10 @@ async def handle_pdf_bytes(pdf_bytes: bytes, conversation_history: list, system_
     return "Сервіс тимчасово перевантажений. Спробуйте через хвилину."
 
 
-async def handle_photo_with_addon(photo_bytes: bytes, conversation_history: list, system_prompt: str = "") -> str:
+async def handle_photo_with_addon(photo_bytes: bytes, conversation_history: list, system_prompt: str = "", media_type: str = "image/jpeg") -> str:
     """Обробник фото (Telegram та webhook) — склеює sales.md з VISION_ADDON"""
     combined = f"{system_prompt}\n\n---\n\n{VISION_ADDON}" if system_prompt else VISION_ADDON
-    return await handle_image_bytes(photo_bytes, "image/jpeg", conversation_history, combined)
+    return await handle_image_bytes(photo_bytes, media_type, conversation_history, combined)
 
 
 async def handle_pdf_with_addon(pdf_bytes: bytes, conversation_history: list, system_prompt: str = "") -> str:
@@ -241,7 +241,7 @@ async def handle_file_url(file_url: str, file_type: str | None, conversation_his
         if media_type == "application/pdf":
             return await handle_pdf_with_addon(file_bytes, conversation_history, system_prompt)
         else:
-            return await handle_photo_with_addon(file_bytes, conversation_history, system_prompt)
+            return await handle_photo_with_addon(file_bytes, conversation_history, system_prompt, media_type)
 
     except httpx.HTTPError as e:
         logger.error(f"Помилка завантаження файлу {file_url}: {e}")
