@@ -61,7 +61,7 @@ async def _download_file(url: str) -> bytes:
 
 
 def _detect_media_type(url: str, content_type: str | None = None) -> str:
-    """Визначає MIME тип файлу"""
+    """Визначає MIME тип файлу за URL або Content-Type заголовком."""
     if content_type and content_type in SUPPORTED_IMAGE_TYPES:
         return content_type
 
@@ -75,14 +75,31 @@ def _detect_media_type(url: str, content_type: str | None = None) -> str:
     elif url_lower.endswith(".webp"):
         return "image/webp"
     else:
-        return "image/jpeg"  # за замовчуванням
+        return "image/jpeg"
+
+
+def _detect_media_type_from_bytes(data: bytes) -> str:
+    """Визначає реальний MIME тип за magic bytes — надійніше ніж URL."""
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    elif data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    elif data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    elif data[:4] == b'%PDF':
+        return "application/pdf"
+    else:
+        return "image/jpeg"
 
 
 async def handle_image_bytes(image_bytes: bytes, media_type: str, conversation_history: list, system_prompt: str) -> str:
     """Передає зображення в Claude Vision і повертає відповідь.
     Перед Claude запускає Google Vision OCR — передає розпізнаний текст як контекст."""
+    # Якщо тип невідомий — ще раз визначаємо з bytes
     if media_type not in SUPPORTED_IMAGE_TYPES:
-        media_type = "image/jpeg"
+        media_type = _detect_media_type_from_bytes(image_bytes)
 
     # OCR-попередник: витягуємо текст (розміри, підписи) з фото/креслення
     from agents.instagram.ocr import extract_text_from_image
@@ -215,7 +232,11 @@ async def handle_file_url(file_url: str, file_type: str | None, conversation_his
         if is_audio:
             return await handle_audio_bytes(file_bytes, mime_hint, conversation_history, system_prompt)
 
-        media_type = _detect_media_type(file_url) if file_type != "pdf" else "application/pdf"
+        # Визначаємо тип за magic bytes — надійніше ніж URL (Instagram CDN не дає розширення)
+        media_type = (
+            "application/pdf" if file_type == "pdf"
+            else _detect_media_type_from_bytes(file_bytes)
+        )
 
         if media_type == "application/pdf":
             return await handle_pdf_with_addon(file_bytes, conversation_history, system_prompt)
