@@ -652,6 +652,18 @@ async def handle_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+def _extract_image_url(text: str) -> str | None:
+    """Витягує CDN-URL зображення з тексту (Instagram/Facebook CDN або пряме посилання)."""
+    import re
+    for url in re.findall(r'https?://[^\s]+', text):
+        url_clean = url.lower().split("?")[0]
+        is_image_ext = any(url_clean.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'))
+        is_cdn = any(cdn in url for cdn in ('cdninstagram.com', 'fbsbx.com', 'fbcdn.net', 'scontent'))
+        if is_image_ext or is_cdn:
+            return url
+    return None
+
+
 async def _ig_webhook_receive(request: web.Request) -> web.Response:
     """POST /instagram/webhook — вхідні DM від Sendrules."""
     secret = request.headers.get("X-Webhook-Secret")
@@ -672,6 +684,14 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     name = body.get("name", "Клієнт")
     file_url = body.get("file_url")
     file_type = body.get("file_type")
+
+    # Fallback: якщо Sendrules не поклав URL у file_url — шукаємо CDN-URL в message
+    if not (file_url and file_url.startswith("http")) and message:
+        detected = _extract_image_url(message)
+        if detected:
+            file_url = detected
+            file_type = file_type or "image"
+            logger.info("IG webhook: CDN-URL знайдено в message → обробляємо як фото: %s", detected[:80])
 
     # Логуємо сирий payload для діагностики типів файлів
     logger.info("IG webhook payload: user=%s file_url=%s file_type=%s message=%s",
