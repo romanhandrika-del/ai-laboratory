@@ -8,6 +8,9 @@ import json
 import os
 import logging
 from dotenv import load_dotenv
+
+load_dotenv()  # має бути до будь-яких app-імпортів, що читають os.getenv при завантаженні
+
 from aiohttp import web
 from telegram import Update
 from telegram.ext import (
@@ -20,7 +23,7 @@ from telegram.ext import (
 from core.logger import get_logger
 from core.message import AgentMessage
 from core.brain_archive import GoogleSheetsBrainArchive, make_brain_record
-from core.conversation_storage import init_db as init_conv_db, save_conversation, get_review, get_stats
+from core.conversation_storage import init_db as init_conv_db, save_conversation, get_review, get_stats, is_phone_number, save_dialog_phone
 from agents.sales.sales_agent import create_sales_agent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
@@ -28,8 +31,6 @@ from agents.web_design.web_design_agent import WebDesignAgent
 from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
 from core.orchestrator import OrchestratorAgent
-
-load_dotenv()
 logger = get_logger(__name__)
 
 init_conv_db()
@@ -116,6 +117,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     logger.info(f"[chat={chat_id}] Вхідне: {user_text[:80]}")
+
+    if is_phone_number(user_text):
+        user_name = (update.effective_user.full_name or update.effective_user.username or "")
+        save_dialog_phone(agent.client_id, str(chat_id), "telegram", user_text, user_name)
 
     # Формуємо повідомлення для агента
     message = AgentMessage(

@@ -4,6 +4,7 @@ PostgreSQL якщо є DATABASE_URL, інакше SQLite.
 """
 
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -166,6 +167,30 @@ def save_conversation(
                  1 if needs_human else 0, model_used, cost_usd,
                  datetime.now().isoformat()),
             )
+
+
+def is_phone_number(text: str) -> bool:
+    digits = re.sub(r"\D", "", text)
+    return bool(re.fullmatch(r"[\d\s\+\-\(\)]{7,20}", text.strip()) and 9 <= len(digits) <= 15)
+
+
+def save_dialog_phone(client_id: str, user_id: str, source: str, phone: str, client_name: str) -> None:
+    if not _USE_PG:
+        return
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO dialogs (client_id, user_id, source, client_name, phone, phone_first_seen)
+                   VALUES (%s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (client_id, user_id, source) DO UPDATE
+                   SET phone            = EXCLUDED.phone,
+                       client_name      = EXCLUDED.client_name,
+                       phone_first_seen = COALESCE(dialogs.phone_first_seen, NOW())
+                   WHERE dialogs.phone IS NULL""",
+                (client_id, user_id, source, client_name, phone),
+            )
+        conn.commit()
+    logger.info("[%s] phone saved for %s/%s", source, client_id, user_id)
 
 
 def load_history(client_id: str, chat_id: int, limit: int = 10) -> list[dict]:

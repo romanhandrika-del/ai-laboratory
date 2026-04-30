@@ -12,7 +12,7 @@ Header: X-Webhook-Secret: <WEBHOOK_SECRET>
 import os
 from core.logger import get_logger
 from core.message import AgentMessage
-from core.conversation_storage import save_conversation
+from core.conversation_storage import save_conversation, is_phone_number, save_dialog_phone
 
 logger = get_logger(__name__)
 
@@ -71,6 +71,9 @@ def handle_message(
         model_used=result.model_used,
         cost_usd=result.cost_usd,
     )
+
+    if is_phone_number(message):
+        save_dialog_phone(sales_agent.client_id, user_id, source, message, name)
 
     logger.info("[%s] %s conf=%.2f needs_human=%s", source, name, result.confidence, result.needs_human)
     return result.content
