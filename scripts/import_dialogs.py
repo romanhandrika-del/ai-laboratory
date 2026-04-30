@@ -20,7 +20,8 @@ from pathlib import Path
 # Додаємо корінь проекту до шляху
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.conversation_storage import init_db, save_conversation
+import asyncio
+from core import db
 
 
 BOT_MARKER = "Вы отправили"
@@ -131,24 +132,22 @@ def _is_client_name(line: str, lines: list, idx: int) -> bool:
     return False
 
 
-def import_to_db(pairs: list[dict], chat_id: int = 999999) -> int:
-    """Зберігає пари в conversations.db. Повертає кількість збережених."""
-    init_db()
+async def _import_to_db_async(pairs: list[dict], chat_id: int = 999999) -> int:
+    await db.init()
     count = 0
     for p in pairs:
         needs_human = any(kw in p["bot"].lower() for kw in ["менеджер", "зв'яжеться", "зателефонує", "notify"])
-        save_conversation(
-            client_id=CLIENT_ID,
-            chat_id=chat_id,
-            user_msg=p["user"],
-            bot_reply=p["bot"],
-            confidence=0.85,
-            needs_human=needs_human,
-            model_used="manager_human",
-            cost_usd=0.0,
+        await db.save_message(CLIENT_ID, str(chat_id), "telegram", "user", p["user"])
+        await db.save_message(
+            CLIENT_ID, str(chat_id), "telegram", "assistant", p["bot"],
+            meta={"confidence": 0.85, "needs_human": needs_human, "model_used": "manager_human", "cost_usd": 0.0},
         )
         count += 1
     return count
+
+
+def import_to_db(pairs: list[dict], chat_id: int = 999999) -> int:
+    return asyncio.run(_import_to_db_async(pairs, chat_id))
 
 
 def main():

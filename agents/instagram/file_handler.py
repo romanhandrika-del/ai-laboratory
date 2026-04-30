@@ -61,7 +61,7 @@ async def _download_file(url: str) -> bytes:
 
 
 def _detect_media_type(url: str, content_type: str | None = None) -> str:
-    """Визначає MIME тип файлу"""
+    """Визначає MIME тип файлу за URL або Content-Type заголовком."""
     if content_type and content_type in SUPPORTED_IMAGE_TYPES:
         return content_type
 
@@ -75,14 +75,31 @@ def _detect_media_type(url: str, content_type: str | None = None) -> str:
     elif url_lower.endswith(".webp"):
         return "image/webp"
     else:
-        return "image/jpeg"  # за замовчуванням
+        return "image/jpeg"
+
+
+def _detect_media_type_from_bytes(data: bytes) -> str:
+    """Визначає реальний MIME тип за magic bytes — надійніше ніж URL."""
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    elif data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    elif data[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    elif data[:4] == b'%PDF':
+        return "application/pdf"
+    else:
+        return "image/jpeg"
 
 
 async def handle_image_bytes(image_bytes: bytes, media_type: str, conversation_history: list, system_prompt: str) -> str:
     """Передає зображення в Claude Vision і повертає відповідь.
     Перед Claude запускає Google Vision OCR — передає розпізнаний текст як контекст."""
+    # Якщо тип невідомий — ще раз визначаємо з bytes
     if media_type not in SUPPORTED_IMAGE_TYPES:
-        media_type = "image/jpeg"
+        media_type = _detect_media_type_from_bytes(image_bytes)
 
     # OCR-попередник: витягуємо текст (розміри, підписи) з фото/креслення
     from agents.instagram.ocr import extract_text_from_image
@@ -97,7 +114,7 @@ async def handle_image_bytes(image_bytes: bytes, media_type: str, conversation_h
         "Текст розпізнаний OCR з фото: (текст не розпізнано — аналізуй тільки зображення)"
     )
 
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({
         "role": "user",
         "content": [
@@ -147,7 +164,7 @@ async def handle_pdf_bytes(pdf_bytes: bytes, conversation_history: list, system_
     if not text:
         return "Не вдалося прочитати PDF. Будь ласка, надішліть файл у форматі JPG або PNG, або опишіть розміри текстом."
 
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({
         "role": "user",
         "content": f"Клієнт надіслав технічне завдання (PDF):\n\n{text[:4000]}"
@@ -170,10 +187,10 @@ async def handle_pdf_bytes(pdf_bytes: bytes, conversation_history: list, system_
     return "Сервіс тимчасово перевантажений. Спробуйте через хвилину."
 
 
-async def handle_photo_with_addon(photo_bytes: bytes, conversation_history: list, system_prompt: str = "") -> str:
+async def handle_photo_with_addon(photo_bytes: bytes, conversation_history: list, system_prompt: str = "", media_type: str = "image/jpeg") -> str:
     """Обробник фото (Telegram та webhook) — склеює sales.md з VISION_ADDON"""
     combined = f"{system_prompt}\n\n---\n\n{VISION_ADDON}" if system_prompt else VISION_ADDON
-    return await handle_image_bytes(photo_bytes, "image/jpeg", conversation_history, combined)
+    return await handle_image_bytes(photo_bytes, media_type, conversation_history, combined)
 
 
 async def handle_pdf_with_addon(pdf_bytes: bytes, conversation_history: list, system_prompt: str = "") -> str:
@@ -215,12 +232,16 @@ async def handle_file_url(file_url: str, file_type: str | None, conversation_his
         if is_audio:
             return await handle_audio_bytes(file_bytes, mime_hint, conversation_history, system_prompt)
 
-        media_type = _detect_media_type(file_url) if file_type != "pdf" else "application/pdf"
+        # Визначаємо тип за magic bytes — надійніше ніж URL (Instagram CDN не дає розширення)
+        media_type = (
+            "application/pdf" if file_type == "pdf"
+            else _detect_media_type_from_bytes(file_bytes)
+        )
 
         if media_type == "application/pdf":
             return await handle_pdf_with_addon(file_bytes, conversation_history, system_prompt)
         else:
-            return await handle_photo_with_addon(file_bytes, conversation_history, system_prompt)
+            return await handle_photo_with_addon(file_bytes, conversation_history, system_prompt, media_type)
 
     except httpx.HTTPError as e:
         logger.error(f"Помилка завантаження файлу {file_url}: {e}")
@@ -243,7 +264,7 @@ async def handle_audio_bytes(audio_bytes: bytes, mime_hint: str, conversation_hi
     logger.info("Голосове розпізнано: %s", text[:80])
 
     # Обробляємо розпізнаний текст як звичайне повідомлення через Claude
-    messages = conversation_history.copy()
+    messages = [{"role": m["role"], "content": m["content"]} for m in conversation_history]
     messages.append({"role": "user", "content": f"[Голосове повідомлення]: {text}"})
 
     for attempt in range(3):

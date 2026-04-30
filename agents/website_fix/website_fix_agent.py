@@ -13,7 +13,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from core.logger import get_logger
-from core.audit_storage import init_db, save_fix, get_last_audit, get_last_fix, update_fix_status
+from core.audit_storage import init_db, get_last_audit
+from core import db
 from agents.website_audit import scraper, seo_extractor, technical_checker
 from agents.website_fix import fix_generator
 from agents.website_fix import ftp_patcher
@@ -60,7 +61,7 @@ class WebsiteFixAgent:
         # 3. Score попереднього аудиту + список вже застосованих фіксів
         last_audit = get_last_audit(self.client_id, url)
         score_before = last_audit["score"] if last_audit else None
-        already_applied = _get_applied_fixes(self.client_id, url)
+        already_applied = await _get_applied_fixes(self.client_id, url)
 
         # 4. Генерація фіксів через Claude
         fix_md, fix_count = fix_generator.generate(
@@ -70,8 +71,8 @@ class WebsiteFixAgent:
         # 5. Зберігаємо файл
         fix_path = _save_fix_file(self.client_id, url, fix_md)
 
-        # 6. Зберігаємо в БД
-        fix_id = save_fix(self.client_id, url, fix_count, str(fix_path), score_before)
+        # 6. Зберігаємо в Neon
+        fix_id = await db.save_fix(self.client_id, url, fix_count, str(fix_path), score_before)
 
         # 7. Summary для Telegram
         summary_text = fix_generator.format_telegram_summary(url, fix_count)
@@ -94,7 +95,7 @@ class WebsiteFixAgent:
         Returns dict:
             ftp_path, fix_count, summary_text, error (якщо є)
         """
-        last_fix = get_last_fix(self.client_id, url)
+        last_fix = await db.get_last_fix(self.client_id, url)
         if not last_fix:
             return {"error": f"Спочатку запусти /fix {url} — пакет фіксів не знайдено"}
 
@@ -108,7 +109,7 @@ class WebsiteFixAgent:
         if result.get("error"):
             return {"error": result["error"], "summary_text": f"❌ FTP помилка: {result['error']}"}
 
-        update_fix_status(
+        await db.update_fix_status(
             last_fix["id"],
             "pushed",
             pr_url=result["ftp_path"],
@@ -137,7 +138,7 @@ class WebsiteFixAgent:
         Returns dict:
             ftp_path, summary_text, error (якщо є)
         """
-        last_fix = get_last_fix(self.client_id, url)
+        last_fix = await db.get_last_fix(self.client_id, url)
         if not last_fix:
             return {"error": f"Немає жодного push для {url}"}
 
@@ -153,7 +154,7 @@ class WebsiteFixAgent:
             logger.error("Rollback помилка: %s", e)
             return {"error": str(e)}
 
-        update_fix_status(last_fix["id"], "rolled_back")
+        await db.update_fix_status(last_fix["id"], "rolled_back")
 
         summary = (
             f"↩️ <b>Rollback виконано!</b>\n"
@@ -165,18 +166,12 @@ class WebsiteFixAgent:
         return {"ftp_path": ftp_path, "summary_text": summary}
 
 
-def _get_applied_fixes(client_id: str, url: str) -> list[str]:
-    """Читає всі pushed/verified фікси з БД і витягує їх назви для контексту Claude."""
-    from core.audit_storage import _get_conn
+async def _get_applied_fixes(client_id: str, url: str) -> list[str]:
+    """Читає всі pushed/verified фікси з Neon і витягує їх назви для контексту Claude."""
     from agents.website_fix.ftp_patcher import parse_fixes
     titles = []
-    with _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT fix_path FROM fix_history WHERE client_id=? AND url=? AND status IN ('pushed','verified') ORDER BY generated_at",
-            (client_id, url),
-        ).fetchall()
-    for row in rows:
-        fix_path = row["fix_path"]
+    paths = await db.get_applied_fix_paths(client_id, url)
+    for fix_path in paths:
         if fix_path and Path(fix_path).exists():
             try:
                 md = Path(fix_path).read_text(encoding="utf-8")

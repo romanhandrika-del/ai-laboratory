@@ -90,10 +90,19 @@ class SalesAgent(BaseAgent):
         logger.info(f"[{self.client_id}] KB перезавантажена")
 
     def run(self, message: AgentMessage) -> AgentResult:
-        # Вибір моделі залежно від складності повідомлення
-        model = MODEL_HAIKU if _is_simple_message(message.content) else MODEL_SONNET
+        summary = (message.metadata or {}).get("client_memory")
+        system_extra = None
+        if summary:
+            system_extra = (
+                "## КОНТЕКСТ ПОПЕРЕДНІХ РОЗМОВ З ЦИМ КЛІЄНТОМ\n\n"
+                f"{summary}\n\n"
+                "Використовуй цей контекст якщо клієнт згадує минулі замовлення, "
+                "ціни що ти називав раніше, або повертається до попередніх обговорень. "
+                "Не повторюй привітання якщо це очевидне продовження старої розмови."
+            )
 
-        result = self._call_api(message, model=model)
+        model = MODEL_HAIKU if _is_simple_message(message.content) else MODEL_SONNET
+        result = self._call_api(message, model=model, system_extra=system_extra)
 
         if result.error:
             return result

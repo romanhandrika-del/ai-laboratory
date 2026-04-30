@@ -8,9 +8,6 @@ import json
 import os
 import logging
 from dotenv import load_dotenv
-
-load_dotenv()  # має бути до будь-яких app-імпортів, що читають os.getenv при завантаженні
-
 from aiohttp import web
 from telegram import Update
 from telegram.ext import (
@@ -20,32 +17,25 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
+from core import db
 from core.logger import get_logger
 from core.message import AgentMessage
 from core.brain_archive import GoogleSheetsBrainArchive, make_brain_record
-from core.conversation_storage import init_db as init_conv_db, save_conversation, get_review, get_stats, is_phone_number, save_dialog_phone
 from agents.sales.sales_agent import create_sales_agent
+from core.orchestrator import OrchestratorAgent
 from agents.website_audit.website_audit_agent import WebsiteAuditAgent
 from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
 from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
-from core.orchestrator import OrchestratorAgent
+from core.phone import extract_phone
+
+load_dotenv()
 logger = get_logger(__name__)
 
-init_conv_db()
-
-# Ініціалізація агента
+# Ініціалізація агентів
 sales_agent = create_sales_agent()
-
-# Registry агентів для OrchestratorAgent
-_agent_registry = {
-    sales_agent.agent_id: sales_agent,
-    "website-audit-v1": WebsiteAuditAgent(client_id="default"),
-    "website-fix-v1": WebsiteFixAgent(client_id="default"),
-    "web-design-v1": WebDesignAgent(client_id="default"),
-    "multimodal-analyst-v1": MultimodalAnalystAgent(client_id="default"),
-}
+orchestrator = OrchestratorAgent(client_id=sales_agent.client_id, sales_agent=sales_agent)
 
 # Brain Archive (якщо є BRAIN_SHEET_ID — логуємо, якщо ні — пропускаємо)
 _brain_sheet_id = os.getenv("BRAIN_SHEET_ID")
@@ -60,33 +50,20 @@ brain_archive = (
 MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID")
 ARCHIVE_CHANNEL_ID = os.getenv("ARCHIVE_CHANNEL_ID", "")
 
-# Conversation history: {chat_id: [messages]}
-_history: dict[int, list[dict]] = {}
-MAX_HISTORY = 8
-
-# Instagram conversation history: {"ig_<sender_id>": [messages]}
-_ig_history: dict[str, list[dict]] = {}
+TG_HISTORY_LIMIT = 8
 
 
-def _get_history(chat_id: int) -> list[dict]:
-    return _history.get(chat_id, [])
-
-
-def _add_to_history(chat_id: int, role: str, content: str) -> None:
-    if chat_id not in _history:
-        _history[chat_id] = []
-    _history[chat_id].append({"role": role, "content": content})
-    # Обрізаємо до MAX_HISTORY повідомлень
-    if len(_history[chat_id]) > MAX_HISTORY:
-        _history[chat_id] = _history[chat_id][-MAX_HISTORY:]
-
-
-async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_text: str, agent_reply: str) -> None:
+async def _notify_manager(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_text: str,
+    agent_reply: str,
+    history: list[dict],
+) -> None:
     """Надсилає менеджеру резюме розмови при ескалації."""
     if not MANAGER_TELEGRAM_ID:
         return
     try:
-        history = _get_history(chat_id)
         history_text = "\n".join(
             f"{'Клієнт' if m['role'] == 'user' else 'Бот'}: {m['content']}"
             for m in history[-6:]
@@ -107,69 +84,119 @@ async def _notify_manager(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user
         logger.error(f"Помилка надсилання менеджеру: {e}")
 
 
+_HEAVY_KEYWORDS = (
+    "аудит", "audit", "фікс", "fix", "push", "деплой", "дизайн", "design",
+    "rollback", "відкат", "pipeline", "під ключ", "аутсорс", "повний цикл",
+)
+
+
+def _is_heavy_request(text: str, is_manager: bool) -> bool:
+    if not is_manager:
+        return False
+    t = text.lower()
+    return any(k in t for k in _HEAVY_KEYWORDS)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     chat_id = update.effective_chat.id
-    agent = OrchestratorAgent(registry=_agent_registry) if str(chat_id) == MANAGER_TELEGRAM_ID else sales_agent
     user_text = (update.message.text or update.message.caption or "").strip()
     if not user_text:
         return
 
     logger.info(f"[chat={chat_id}] Вхідне: {user_text[:80]}")
 
-    if is_phone_number(user_text):
-        user_name = (update.effective_user.full_name or update.effective_user.username or "")
-        save_dialog_phone(agent.client_id, str(chat_id), "telegram", user_text, user_name)
+    is_manager = bool(MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID))
 
-    # Формуємо повідомлення для агента
-    message = AgentMessage(
-        content=user_text,
-        client_id=agent.client_id,
-        context=_get_history(chat_id),
-        metadata={"chat_id": chat_id, "source": "telegram"},
+    # Trainer approval: перехоплюємо "так/ні/diff" якщо є pending review
+    if is_manager:
+        pending = await db.get_pending_review(sales_agent.client_id)
+        if pending:
+            from core.orchestrator import invalidate_orchestrator_prompt_cache
+            cmd = user_text.strip().lower()
+            if cmd in ("так", "yes", "ок", "затверди"):
+                v = await db.save_agent_prompt(
+                    sales_agent.client_id, "orchestrator",
+                    pending["new_prompt"], "auto-trainer",
+                )
+                await db.clear_pending_review(sales_agent.client_id)
+                invalidate_orchestrator_prompt_cache()
+                await update.message.reply_text(f"✅ Промпт оновлено до версії {v}")
+                return
+            elif cmd in ("ні", "no", "пропусти", "skip"):
+                await db.clear_pending_review(sales_agent.client_id)
+                await update.message.reply_text("Пропущено. Промпт без змін.")
+                return
+            elif cmd in ("diff", "деталі"):
+                try:
+                    issues_list = json.loads(pending["issues_summary"])
+                    cl_list = json.loads(pending["change_log"])
+                except Exception:
+                    issues_list = [pending["issues_summary"]]
+                    cl_list = []
+                current = await db.get_agent_prompt(sales_agent.client_id, "orchestrator") or ""
+                issues_text = "\n".join(f"• {i}" for i in issues_list[:5])
+                cl_text = "\n".join(f"• {c}" for c in cl_list[:5])
+                msg = (
+                    f"<b>Знайдені проблеми:</b>\n{issues_text}\n\n"
+                    f"<b>Зміни:</b>\n{cl_text}\n\n"
+                    f"<b>Було (початок):</b>\n<code>{current[:400]}</code>\n\n"
+                    f"<b>Стане (початок):</b>\n<code>{pending['new_prompt'][:400]}</code>"
+                )
+                await update.message.reply_html(msg)
+                return
+
+    if _is_heavy_request(user_text, is_manager):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    result = await orchestrator.route(
+        user_text=user_text,
+        user_id=str(chat_id),
+        source="telegram",
+        is_manager=is_manager,
     )
 
-    # Запускаємо агента
-    result = agent.run(message)
-
-    # Зберігаємо в history
-    _add_to_history(chat_id, "user", user_text)
-    _add_to_history(chat_id, "assistant", result.content)
-
-    # Логуємо розмову в SQLite
-    save_conversation(
-        client_id=agent.client_id,
-        chat_id=chat_id,
-        user_msg=user_text,
-        bot_reply=result.content,
-        confidence=result.confidence,
-        needs_human=result.needs_human,
-        model_used=result.model_used,
-        cost_usd=result.cost_usd,
+    is_sales = result.agent_id.startswith("sales")
+    await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", user_text)
+    tg_name = update.effective_user.full_name if update.effective_user else None
+    await db.update_client_profile(
+        sales_agent.client_id, str(chat_id), "telegram",
+        name=tg_name,
+        phone=extract_phone(user_text),
+    )
+    await db.save_message(
+        sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
+        meta={
+            "agent_id": result.agent_id,
+            "confidence": result.confidence,
+            "needs_human": result.needs_human,
+            "model_used": result.model_used,
+            "cost_usd": result.cost_usd,
+        },
     )
 
-    # Відповідаємо клієнту
-    await update.message.reply_text(result.content)
+    if is_sales:
+        await update.message.reply_text(result.content)
+    else:
+        await update.message.reply_html(result.content)
 
     logger.info(
-        f"[chat={chat_id}] confidence={result.confidence:.2f} "
+        f"[chat={chat_id}] agent={result.agent_id} confidence={result.confidence:.2f} "
         f"needs_human={result.needs_human} cost=${result.cost_usd:.4f}"
     )
 
-    # Ескалація до менеджера
     if result.needs_human:
-        await _notify_manager(context, chat_id, user_text, result.content)
+        history = await db.load_history(sales_agent.client_id, str(chat_id), "telegram", limit=6)
+        await _notify_manager(context, chat_id, user_text, result.content, history)
 
-    # Логуємо в Brain Archive
-
-    if brain_archive:
+    if brain_archive and is_sales:
         try:
             record = make_brain_record(
                 result=result,
                 task=user_text[:100],
                 sentiment="neutral",
-                prompt_version=agent.prompt_version,
+                prompt_version=sales_agent.prompt_version,
             )
             brain_archive.write(record)
         except Exception as e:
@@ -202,31 +229,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     logger.info("[chat=%d] Голосове розпізнано: %s", chat_id, user_text[:80])
 
-    result = sales_agent.run(AgentMessage(
-        content=user_text,
-        client_id=sales_agent.client_id,
-        context=_get_history(chat_id),
-        metadata={"chat_id": chat_id, "source": "telegram_voice"},
-    ))
-
-    _add_to_history(chat_id, "user", user_text)
-    _add_to_history(chat_id, "assistant", result.content)
-
-    save_conversation(
-        client_id=sales_agent.client_id,
-        chat_id=chat_id,
-        user_msg=f"[voice] {user_text}",
-        bot_reply=result.content,
-        confidence=result.confidence,
-        needs_human=result.needs_human,
-        model_used=result.model_used,
-        cost_usd=result.cost_usd,
+    result = await orchestrator.route(
+        user_text=user_text,
+        user_id=str(chat_id),
+        source="telegram_voice",
+        is_manager=bool(MANAGER_TELEGRAM_ID and str(chat_id) == str(MANAGER_TELEGRAM_ID)),
     )
+
+    is_sales = result.agent_id.startswith("sales")
+    if is_sales:
+        await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", f"[voice] {user_text}")
+        await db.save_message(
+            sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
+            meta={
+                "confidence": result.confidence,
+                "needs_human": result.needs_human,
+                "model_used": result.model_used,
+                "cost_usd": result.cost_usd,
+            },
+        )
 
     await update.message.reply_text(result.content)
 
     if result.needs_human:
-        await _notify_manager(context, chat_id, user_text, result.content)
+        history = await db.load_history(sales_agent.client_id, str(chat_id), "telegram", limit=6)
+        await _notify_manager(context, chat_id, user_text, result.content, history)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -259,6 +286,9 @@ async def handle_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     url = args[0].strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Очищаємо session_state щоб не конфліктував з orchestrator-діалогом
+    await db.clear_session_state(sales_agent.client_id, str(chat_id), "telegram")
 
     await update.message.reply_text(f"⏳ Аналізую сайт: {url}\nЦе займе ~30-90 секунд...")
 
@@ -441,9 +471,7 @@ async def handle_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("⏳ Аналізую діалоги...")
 
     from agents.sales.trainer import run_training
-    result = await asyncio.to_thread(
-        run_training, sales_agent.client_id, 30, only_low
-    )
+    result = await run_training(sales_agent.client_id, 30, only_low)
 
     if result.get("error"):
         await update.message.reply_text(f"❌ Помилка тренування:\n{result['error']}")
@@ -481,8 +509,8 @@ async def handle_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     only_low = "low" in (context.args or [])
-    stats = get_stats(sales_agent.client_id)
-    rows = get_review(sales_agent.client_id, limit=10, only_low=only_low)
+    stats = await db.get_dialogs_stats(sales_agent.client_id)
+    rows = await db.get_dialogs_review(sales_agent.client_id, limit=10, only_low=only_low)
 
     header = (
         f"📊 <b>Sales Agent — огляд розмов</b>\n"
@@ -631,6 +659,18 @@ async def handle_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+def _extract_image_url(text: str) -> str | None:
+    """Витягує CDN-URL зображення з тексту (Instagram/Facebook CDN або пряме посилання)."""
+    import re
+    for url in re.findall(r'https?://[^\s]+', text):
+        url_clean = url.lower().split("?")[0]
+        is_image_ext = any(url_clean.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'))
+        is_cdn = any(cdn in url for cdn in ('cdninstagram.com', 'fbsbx.com', 'fbcdn.net', 'scontent'))
+        if is_image_ext or is_cdn:
+            return url
+    return None
+
+
 async def _ig_webhook_receive(request: web.Request) -> web.Response:
     """POST /instagram/webhook — вхідні DM від Sendrules."""
     secret = request.headers.get("X-Webhook-Secret")
@@ -652,6 +692,18 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     file_url = body.get("file_url")
     file_type = body.get("file_type")
 
+    # Sendrules bug: file_url дорівнює тексту message або не є URL — скидаємо
+    if file_url and (file_url == message or not file_url.startswith("http")):
+        file_url = None
+
+    # Fallback: якщо Sendrules не поклав URL у file_url — шукаємо CDN-URL в message
+    if not file_url and message:
+        detected = _extract_image_url(message)
+        if detected:
+            file_url = detected
+            file_type = file_type or "image"
+            logger.info("IG webhook: CDN-URL знайдено в message → обробляємо як фото: %s", detected[:80])
+
     # Логуємо сирий payload для діагностики типів файлів
     logger.info("IG webhook payload: user=%s file_url=%s file_type=%s message=%s",
                 user_id, file_url, file_type, message[:50] if message else "")
@@ -661,15 +713,13 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
 
     try:
         # Якщо прийшло фото/PDF — обробляємо через Claude Vision + Google OCR
-        # file_url може прийти як {{last_message}} — перевіряємо що це справжній URL
-        if file_url and file_url.startswith("http") and file_type != "text":
+        if file_url and file_url.startswith("http"):
             from agents.instagram.file_handler import handle_file_url
-            from agents.instagram.instagram_agent import _history, MAX_HISTORY
-            context = _history.get(user_id, [])
+            from agents.instagram.instagram_agent import MAX_HISTORY
+            context = await db.load_history(sales_agent.client_id, user_id, source, limit=MAX_HISTORY)
             reply = await handle_file_url(
                 file_url, file_type, context, sales_agent.system_prompt
             )
-            # Зберігаємо в history
             if file_type in ("audio", "voice"):
                 label = "[voice]"
             elif file_type == "pdf":
@@ -677,27 +727,21 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
             else:
                 label = "[photo]"
             ctx_msg = f"{label} {message}".strip() if message else label
-            context.append({"role": "user", "content": ctx_msg})
-            context.append({"role": "assistant", "content": reply})
-            _history[user_id] = context[-MAX_HISTORY:]
-            # Логуємо в SQLite
             needs_human = "[NOTIFY_MANAGER]" in reply
-            save_conversation(
-                client_id=sales_agent.client_id,
-                chat_id=hash(user_id) & 0x7FFFFFFF,
-                user_msg=ctx_msg,
-                bot_reply=reply,
-                confidence=0.9,
-                needs_human=needs_human,
-                model_used="claude-sonnet-4-6",
-                cost_usd=0.0,
+            await db.save_message(sales_agent.client_id, user_id, source, "user", ctx_msg)
+            await db.update_client_profile(
+                sales_agent.client_id, user_id, source,
+                name=name if name and name != "Клієнт" else None,
+                phone=extract_phone(message) if message else None,
+            )
+            await db.save_message(
+                sales_agent.client_id, user_id, source, "assistant", reply,
+                meta={"confidence": 0.9, "needs_human": needs_human, "model_used": "claude-sonnet-4-6", "cost_usd": 0.0},
             )
         else:
             if not message:
                 return web.json_response({"reply": ""})
-            reply = await asyncio.to_thread(
-                ig_handle_message, user_id, message, source, name, sales_agent
-            )
+            reply = await ig_handle_message(user_id, message, source, name, sales_agent)
     except Exception as e:
         logger.error("Instagram handle error: %s", e)
         return web.json_response({"reply": "Вибачте, виникла помилка. Спробуйте ще раз."})
@@ -728,8 +772,102 @@ async def _run_aiohttp(tg_app, port: int) -> None:
     await asyncio.Event().wait()
 
 
+async def daily_trainer_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """08:00 Kyiv (05:00 UTC): analyze manager dialogs, propose improved orchestrator prompt."""
+    if not MANAGER_TELEGRAM_ID:
+        return
+    try:
+        from agents.orchestrator_trainer.analyzer import analyze
+        r = await analyze(sales_agent.client_id, hours=24)
+        if r.get("skip"):
+            logger.info("[trainer] skip: %s", r.get("reason"))
+            return
+        issues_text = "\n".join(f"• {i}" for i in r["issues"][:5])
+        change_text = "\n".join(f"• {c}" for c in r.get("change_log", [])[:5])
+        text = (
+            f"🌅 <b>Ранковий аудит оркестранта</b>\n"
+            f"Проаналізовано: {r['dialogs_count']} повідомлень\n\n"
+            f"<b>Знайдено проблем: {len(r['issues'])}</b>\n{issues_text}\n\n"
+            f"<b>Зміни:</b>\n{change_text}\n\n"
+            f"Затвердити нову версію промпту? <b>так / ні / diff</b>"
+        )
+        await context.bot.send_message(
+            chat_id=MANAGER_TELEGRAM_ID, text=text, parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error("[daily_trainer] failed: %s", e, exc_info=True)
+
+
+async def handle_test_trainer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /test_trainer — вручну запускає аналіз оркестранта."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    await update.message.reply_text("⏳ Запускаю аналіз діалогів оркестранта...")
+    await daily_trainer_job(context)
+
+
+async def handle_prompt_rollback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /prompt_rollback — відкочує промпт оркестранта до попередньої версії."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    from core.orchestrator import invalidate_orchestrator_prompt_cache
+    v = await db.rollback_agent_prompt(sales_agent.client_id, "orchestrator")
+    if v is None:
+        await update.message.reply_text("Попередня версія відсутня — відкотити нема куди.")
+        return
+    invalidate_orchestrator_prompt_cache()
+    await update.message.reply_text(f"↩️ Промпт оркестранта відкочено до версії {v}")
+
+
+async def handle_ack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /ack — підтвердження перегляду (використовується в approval flow)."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    await update.message.reply_text("ℹ️ Щоб затвердити новий промпт, відповідайте 'так' або 'ні' на звіт тренера.")
+
+
+async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автоматичний запуск тренування щодня о 9:00 Київ (06:00 UTC)."""
+    if not MANAGER_TELEGRAM_ID:
+        return
+    try:
+        from agents.sales.trainer import run_training
+        result = await run_training(sales_agent.client_id, 30, only_low=False)
+        if result.get("error"):
+            await context.bot.send_message(
+                chat_id=MANAGER_TELEGRAM_ID,
+                text=f"⚠️ Авто-тренування: помилка\n{result['error']}",
+            )
+            return
+        suggestions = result.get("suggestions", [])
+        written = result.get("written", 0)
+        if not suggestions:
+            return
+        lines = [f"🧠 <b>Авто-тренування завершено</b>\nЗаписано: {written} пропозицій\n"]
+        for s in suggestions[:5]:
+            prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
+            lines.append(
+                f"{prio} <b>{s.get('type', '')} — {s.get('priority', '')}</b>\n"
+                f"{s.get('suggestion', '')}\n"
+            )
+        if len(suggestions) > 5:
+            lines.append(f"<i>...ще {len(suggestions) - 5} пропозицій у Sheets</i>")
+        await context.bot.send_message(
+            chat_id=MANAGER_TELEGRAM_ID,
+            text="\n".join(lines),
+            parse_mode="HTML",
+        )
+        logger.info("Авто-тренування завершено: %d пропозицій", len(suggestions))
+    except Exception as e:
+        logger.error("scheduled_train error: %s", e)
+
+
 def _build_tg_app(token: str):
     tg_app = ApplicationBuilder().token(token).build()
+    from datetime import time as dt_time
+    tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0))
+    # Daily orchestrator trainer: 08:00 Kyiv = 05:00 UTC
+    tg_app.job_queue.run_daily(daily_trainer_job, time=dt_time(hour=5, minute=0))
     tg_app.add_handler(CommandHandler("start", handle_start))
     tg_app.add_handler(CommandHandler("reload_kb", handle_reload_kb))
     tg_app.add_handler(CommandHandler("review", handle_review))
@@ -740,6 +878,9 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("design", handle_design))
     tg_app.add_handler(CommandHandler("train", handle_train))
     tg_app.add_handler(CommandHandler("analyze", handle_analyze))
+    tg_app.add_handler(CommandHandler("test_trainer", handle_test_trainer))
+    tg_app.add_handler(CommandHandler("prompt_rollback", handle_prompt_rollback))
+    tg_app.add_handler(CommandHandler("ack", handle_ack))
     tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Фото або документ з caption /analyze → Multimodal Analyst
     tg_app.add_handler(MessageHandler(
@@ -763,6 +904,8 @@ def main() -> None:
         logger.info("🤖 AI Laboratory Bot запущено (aiohttp: %s)", webhook_url)
 
         async def _start():
+            await db.init()
+            await db.check_connection()
             await tg_app.initialize()
             await tg_app.start()
             await tg_app.bot.set_webhook(
@@ -774,7 +917,16 @@ def main() -> None:
         asyncio.run(_start())
     else:
         logger.info("🤖 AI Laboratory Bot запущено (polling)")
-        tg_app.run_polling(drop_pending_updates=True)
+
+        async def _polling_start():
+            await db.init()
+            await db.check_connection()
+            await tg_app.initialize()
+            await tg_app.start()
+            await tg_app.updater.start_polling(drop_pending_updates=True)
+            await asyncio.Event().wait()
+
+        asyncio.run(_polling_start())
 
 
 if __name__ == "__main__":

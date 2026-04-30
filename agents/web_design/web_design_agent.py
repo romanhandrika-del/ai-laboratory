@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from core.logger import get_logger
-from core.audit_storage import init_db, save_design
+from core import db
 from agents.website_audit import scraper, seo_extractor
 from agents.web_design import design_extractor, design_generator
 
@@ -31,7 +31,6 @@ class WebDesignAgent:
 
     def __init__(self, client_id: str = "default"):
         self.client_id = client_id
-        init_db()
 
     async def design(self, url_or_brief: str) -> dict:
         """
@@ -66,7 +65,7 @@ class WebDesignAgent:
             slug = re.sub(r"\W+", "-", url_or_brief[:40]).strip("-").lower()
 
         design_dir = _save_design_files(self.client_id, slug, brief_md, mockup_html)
-        save_design(self.client_id, url_or_brief, mode, str(design_dir))
+        await db.save_design(self.client_id, url_or_brief, mode, str(design_dir))
 
         summary_text = design_generator.format_telegram_summary(url_or_brief, mode)
 

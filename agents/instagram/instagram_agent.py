@@ -9,14 +9,15 @@ Webhook payload (від Sendrules):
 Header: X-Webhook-Secret: <WEBHOOK_SECRET>
 """
 
+import asyncio
 import os
+from core import db
 from core.logger import get_logger
 from core.message import AgentMessage
-from core.conversation_storage import save_conversation, is_phone_number, save_dialog_phone
+from core.phone import extract_phone
 
 logger = get_logger(__name__)
 
-_history: dict[str, list[dict]] = {}
 MAX_HISTORY = 20
 
 
@@ -27,7 +28,7 @@ def verify_secret(secret_header: str | None) -> bool:
     return secret_header == expected
 
 
-def handle_message(
+async def handle_message(
     user_id: str,
     message: str,
     source: str,
@@ -38,42 +39,35 @@ def handle_message(
     Обробляє вхідне DM від Sendrules.
     Повертає reply рядок для відправки назад клієнту.
     """
-    if user_id not in _history:
-        if len(_history) >= 1000:
-            del _history[next(iter(_history))]
-        # Відновлюємо контекст з БД після рестарту Railway
-        chat_id = hash(user_id) & 0x7FFFFFFF
-        from core.conversation_storage import load_history
-        _history[user_id] = load_history(sales_agent.client_id, chat_id, limit=10)
-
-    context = _history[user_id]
-    context.append({"role": "user", "content": message})
-    if len(context) > MAX_HISTORY:
-        context = context[-MAX_HISTORY:]
-        _history[user_id] = context
+    from agents.sales.memory import should_update_summary, update_summary
+    client_id = sales_agent.client_id
+    context = await db.load_history(client_id, user_id, source, limit=MAX_HISTORY)
+    summary = await db.get_summary(client_id, user_id, source)
 
     result = sales_agent.run(AgentMessage(
         content=message,
-        client_id=sales_agent.client_id,
-        context=context[:-1],
-        metadata={"source": source, "user_id": user_id, "name": name},
+        client_id=client_id,
+        context=context,
+        metadata={"source": source, "user_id": user_id, "name": name, "client_memory": summary},
     ))
 
-    context.append({"role": "assistant", "content": result.content})
-
-    save_conversation(
-        client_id=sales_agent.client_id,
-        chat_id=hash(user_id) & 0x7FFFFFFF,
-        user_msg=message,
-        bot_reply=result.content,
-        confidence=result.confidence,
-        needs_human=result.needs_human,
-        model_used=result.model_used,
-        cost_usd=result.cost_usd,
+    await db.save_message(client_id, user_id, source, "user", message)
+    await db.update_client_profile(
+        client_id, user_id, source,
+        name=name if name and name != "Клієнт" else None,
+        phone=extract_phone(message),
+    )
+    await db.save_message(
+        client_id, user_id, source, "assistant", result.content,
+        meta={
+            "confidence": result.confidence,
+            "needs_human": result.needs_human,
+            "model_used": result.model_used,
+            "cost_usd": result.cost_usd,
+        },
     )
 
-    if is_phone_number(message):
-        save_dialog_phone(sales_agent.client_id, user_id, source, message, name)
-
     logger.info("[%s] %s conf=%.2f needs_human=%s", source, name, result.confidence, result.needs_human)
+    if await should_update_summary(client_id, user_id, source):
+        asyncio.create_task(update_summary(client_id, user_id, source))
     return result.content
