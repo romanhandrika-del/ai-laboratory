@@ -50,7 +50,7 @@ async def update_summary(client_id: str, user_id: str, source: str) -> None:
         if not messages:
             return
 
-        dialog_text = _format_messages(messages)
+        dialog_text = _format_messages(messages[-100:])
         client = anthropic.AsyncAnthropic()
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -60,6 +60,15 @@ async def update_summary(client_id: str, user_id: str, source: str) -> None:
         )
         summary = response.content[0].text.strip()
         cost = (response.usage.input_tokens * 0.80 + response.usage.output_tokens * 4.00) / 1_000_000
+
+        profile = await db.get_client_profile(client_id, user_id, source)
+        profile_parts = []
+        if profile.get("client_name"):
+            profile_parts.append(profile["client_name"])
+        if profile.get("phone"):
+            profile_parts.append(f"тел. {profile['phone']}")
+        if profile_parts:
+            summary = f"Профіль: {', '.join(profile_parts)}\n\n{summary}"
 
         await db.save_summary(client_id, user_id, source, summary, len(messages))
         logger.info(

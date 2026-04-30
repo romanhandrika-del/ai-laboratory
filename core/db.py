@@ -46,6 +46,9 @@ CREATE INDEX IF NOT EXISTS idx_dialogs_messages_gin ON dialogs USING GIN (messag
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary TEXT;
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMPTZ;
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS summary_msg_count INT DEFAULT 0;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS client_name TEXT;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS phone_first_seen TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS trainer_suggestions (
     id          SERIAL PRIMARY KEY,
@@ -223,8 +226,6 @@ async def save_message(
             else:
                 messages = list(row["messages"])
                 messages.append(new_msg)
-                if len(messages) > 200:
-                    messages = messages[-200:]
             await conn.execute(
                 """INSERT INTO dialogs (client_id, user_id, source, messages)
                    VALUES ($1, $2, $3, $4)
@@ -301,6 +302,54 @@ async def get_summary_msg_count(client_id: str, user_id: str, source: str) -> tu
     if row is None:
         return 0, 0
     return row["total"], row["smc"]
+
+
+# ── Client profile ───────────────────────────────────────────────────────────
+
+async def update_client_profile(
+    client_id: str,
+    user_id: str,
+    source: str,
+    name: str | None = None,
+    phone: str | None = None,
+) -> None:
+    """Заповнює client_name і phone тільки якщо вони ще порожні."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE dialogs
+               SET
+                 client_name      = COALESCE(client_name, $4),
+                 phone            = COALESCE(phone, $5),
+                 phone_first_seen = CASE
+                   WHEN phone IS NULL AND $5 IS NOT NULL THEN NOW()
+                   ELSE phone_first_seen
+                 END
+               WHERE client_id=$1 AND user_id=$2 AND source=$3""",
+            client_id, user_id, source, name or None, phone or None,
+        )
+
+
+async def get_client_profile(
+    client_id: str,
+    user_id: str,
+    source: str,
+) -> dict:
+    """Повертає {client_name, phone, phone_first_seen} або порожній dict."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT client_name, phone, phone_first_seen FROM dialogs "
+            "WHERE client_id=$1 AND user_id=$2 AND source=$3",
+            client_id, user_id, source,
+        )
+    if not row:
+        return {}
+    return {
+        "client_name": row["client_name"],
+        "phone": row["phone"],
+        "phone_first_seen": row["phone_first_seen"],
+    }
 
 
 # ── Review / Stats ────────────────────────────────────────────────────────────

@@ -28,6 +28,7 @@ from agents.website_fix.website_fix_agent import WebsiteFixAgent
 from agents.web_design.web_design_agent import WebDesignAgent
 from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
+from core.phone import extract_phone
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -158,6 +159,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_sales = result.agent_id.startswith("sales")
     await db.save_message(sales_agent.client_id, str(chat_id), "telegram", "user", user_text)
+    tg_name = update.effective_user.full_name if update.effective_user else None
+    await db.update_client_profile(
+        sales_agent.client_id, str(chat_id), "telegram",
+        name=tg_name,
+        phone=extract_phone(user_text),
+    )
     await db.save_message(
         sales_agent.client_id, str(chat_id), "telegram", "assistant", result.content,
         meta={
@@ -722,6 +729,11 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
             ctx_msg = f"{label} {message}".strip() if message else label
             needs_human = "[NOTIFY_MANAGER]" in reply
             await db.save_message(sales_agent.client_id, user_id, source, "user", ctx_msg)
+            await db.update_client_profile(
+                sales_agent.client_id, user_id, source,
+                name=name if name and name != "Клієнт" else None,
+                phone=extract_phone(message) if message else None,
+            )
             await db.save_message(
                 sales_agent.client_id, user_id, source, "assistant", reply,
                 meta={"confidence": 0.9, "needs_human": needs_human, "model_used": "claude-sonnet-4-6", "cost_usd": 0.0},

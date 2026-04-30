@@ -14,6 +14,7 @@ import os
 from core import db
 from core.logger import get_logger
 from core.message import AgentMessage
+from core.phone import extract_phone
 
 logger = get_logger(__name__)
 
@@ -51,6 +52,11 @@ async def handle_message(
     ))
 
     await db.save_message(client_id, user_id, source, "user", message)
+    await db.update_client_profile(
+        client_id, user_id, source,
+        name=name if name and name != "Клієнт" else None,
+        phone=extract_phone(message),
+    )
     await db.save_message(
         client_id, user_id, source, "assistant", result.content,
         meta={
