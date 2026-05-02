@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS trainer_suggestions (
     suggestion  TEXT,
     status      TEXT DEFAULT 'new'
 );
+ALTER TABLE trainer_suggestions ADD COLUMN IF NOT EXISTS category            TEXT;
+ALTER TABLE trainer_suggestions ADD COLUMN IF NOT EXISTS root_cause          TEXT;
+ALTER TABLE trainer_suggestions ADD COLUMN IF NOT EXISTS improvement_hypothesis TEXT;
+ALTER TABLE trainer_suggestions ADD COLUMN IF NOT EXISTS evidence_quote      TEXT;
 
 CREATE TABLE IF NOT EXISTS analysis_history (
     id                  SERIAL PRIMARY KEY,
@@ -427,14 +431,31 @@ async def save_trainer_suggestion(
     priority: str,
     problem: str,
     suggestion: str,
+    category: str = "",
+    root_cause: str = "",
+    improvement_hypothesis: str = "",
+    evidence_quote: str = "",
 ) -> None:
     pool = _get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO trainer_suggestions (client_id, type, priority, problem, suggestion)
-               VALUES ($1, $2, $3, $4, $5)""",
+            """INSERT INTO trainer_suggestions
+               (client_id, type, priority, problem, suggestion,
+                category, root_cause, improvement_hypothesis, evidence_quote)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
             client_id, type, priority, problem, suggestion,
+            category, root_cause, improvement_hypothesis, evidence_quote,
         )
+
+
+async def mark_trainer_suggestion(suggestion_id: int, status: str) -> bool:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE trainer_suggestions SET status=$1 WHERE id=$2",
+            status, suggestion_id,
+        )
+    return result == "UPDATE 1"
 
 
 async def list_trainer_suggestions(client_id: str, status: str = "new") -> list[dict]:

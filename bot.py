@@ -826,6 +826,58 @@ async def handle_ack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("ℹ️ Щоб затвердити новий промпт, відповідайте 'так' або 'ні' на звіт тренера.")
 
 
+async def handle_list_suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list_suggestions — показує нові пропозиції тренера з БД."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    from core import db as _db
+    suggestions = await _db.list_trainer_suggestions(sales_agent.client_id, status="new")
+    if not suggestions:
+        await update.message.reply_text("Немає нових пропозицій.")
+        return
+    lines = [f"📋 <b>Пропозиції тренера</b> ({len(suggestions)} нових)\n"]
+    for s in suggestions[:10]:
+        prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
+        cat = s.get("category") or ""
+        lines.append(
+            f"{prio} <b>#{s['id']} {s.get('type', '')} [{cat}]</b>\n"
+            f"<b>Проблема:</b> {s.get('problem', '')}\n"
+            f"<b>Причина:</b> {s.get('root_cause', '') or '—'}\n"
+            f"<b>Пропозиція:</b> {s.get('suggestion', '')}\n"
+            f"<b>Ефект:</b> {s.get('improvement_hypothesis', '') or '—'}\n"
+            f"<i>«{s.get('evidence_quote', '') or '—'}»</i>\n"
+            f"Позначити: /mark_suggestion {s['id']} done | /mark_suggestion {s['id']} rejected\n"
+        )
+    if len(suggestions) > 10:
+        lines.append(f"<i>...ще {len(suggestions) - 10} пропозицій</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def handle_mark_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mark_suggestion <id> <done|rejected|new> — змінює статус пропозиції."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Використання: /mark_suggestion <id> <done|rejected|new>")
+        return
+    try:
+        suggestion_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+        return
+    status = args[1].lower()
+    if status not in ("done", "rejected", "new"):
+        await update.message.reply_text("Статус: done | rejected | new")
+        return
+    from core import db as _db
+    ok = await _db.mark_trainer_suggestion(suggestion_id, status)
+    if ok:
+        await update.message.reply_text(f"✅ Пропозиція #{suggestion_id} → {status}")
+    else:
+        await update.message.reply_text(f"⚠️ Пропозицію #{suggestion_id} не знайдено.")
+
+
 async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Автоматичний запуск тренування щодня о 9:00 Київ (06:00 UTC)."""
     if not MANAGER_TELEGRAM_ID:
@@ -881,6 +933,8 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("test_trainer", handle_test_trainer))
     tg_app.add_handler(CommandHandler("prompt_rollback", handle_prompt_rollback))
     tg_app.add_handler(CommandHandler("ack", handle_ack))
+    tg_app.add_handler(CommandHandler("list_suggestions", handle_list_suggestions))
+    tg_app.add_handler(CommandHandler("mark_suggestion", handle_mark_suggestion))
     tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Фото або документ з caption /analyze → Multimodal Analyst
     tg_app.add_handler(MessageHandler(

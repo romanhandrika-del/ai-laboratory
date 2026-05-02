@@ -13,27 +13,44 @@ from core.logger import get_logger
 logger = get_logger(__name__)
 
 _ANALYSIS_PROMPT = """Ти — тренер Sales Agent для компанії з виробництва скляних виробів (двері, перегородки, душові).
-Проаналізуй діалоги нижче і дай конкретні пропозиції щодо покращення відповідей агента.
+Проаналізуй НАЙГІРШІ діалоги нижче (відфільтровані за низькою впевненістю та ескалаціями).
+Дай конкретні пропозиції щодо покращення відповідей агента.
 
 Для кожної пропозиції вкажи:
-- Тип: FAQ / Prompt / Pricing / Escalation
-- Проблема: що пішло не так або що можна покращити
-- Пропозиція: конкретний текст або правило
-- Пріоритет: High / Medium / Low
+- type: FAQ / Prompt / Pricing / Escalation
+- category: knowledge_gap / wrong_tone / missing_info / calculation_error / escalation_handling
+- priority: High / Medium / Low
+- problem: що пішло не так (1-2 речення)
+- root_cause: чому це сталось (прогалина в промпті, FAQ, логіці?)
+- suggestion: конкретний текст або правило для виправлення
+- improvement_hypothesis: як це зміниться після правки (очікуваний ефект)
+- evidence_quote: дослівна цитата з діалогу, що підтверджує проблему (до 100 символів)
 
-Відповідь у форматі JSON-масиву:
+Відповідь ТІЛЬКИ у форматі JSON-масиву:
 [
   {
     "type": "FAQ",
+    "category": "knowledge_gap",
+    "priority": "High",
     "problem": "Клієнт питав про монтаж — бот не знав деталей",
+    "root_cause": "В FAQ немає розділу про монтаж",
     "suggestion": "Додати в FAQ: Монтаж входить у вартість, займає 1 день.",
-    "priority": "High"
-  },
-  ...
+    "improvement_hypothesis": "Клієнт отримає відповідь без ескалації до менеджера",
+    "evidence_quote": "а монтаж окремо платний?"
+  }
 ]
 
 Якщо все добре — верни порожній масив [].
 Не вигадуй проблем якщо їх немає."""
+
+
+def _score_dialog(r: dict) -> float:
+    """Чим вище — тим гірший діалог. Ескалація = +1, низька впевненість = (1 - confidence)."""
+    return (1.0 - r["confidence"]) + (1.0 if r["needs_human"] else 0.0)
+
+
+def _pick_worst(rows: list[dict], n: int = 10) -> list[dict]:
+    return sorted(rows, key=_score_dialog, reverse=True)[:n]
 
 
 def _format_dialogs(rows: list[dict]) -> str:
@@ -51,7 +68,7 @@ def _format_dialogs(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def run_training(client_id: str, limit: int = 30, only_low: bool = False) -> dict:
+async def run_training(client_id: str, limit: int = 50, only_low: bool = False) -> dict:
     """
     Основна функція тренування.
     Повертає {"suggestions": [...], "written": N, "error": None}.
@@ -59,6 +76,8 @@ async def run_training(client_id: str, limit: int = 30, only_low: bool = False) 
     rows = await db.get_dialogs_review(client_id, limit=limit, only_low=only_low)
     if not rows:
         return {"suggestions": [], "written": 0, "error": None, "msg": "Немає діалогів для аналізу."}
+
+    rows = _pick_worst(rows, n=10)
 
     dialogs_text = _format_dialogs(rows)
 
@@ -88,6 +107,10 @@ async def run_training(client_id: str, limit: int = 30, only_low: bool = False) 
                     priority=s.get("priority", ""),
                     problem=s.get("problem", ""),
                     suggestion=s.get("suggestion", ""),
+                    category=s.get("category", ""),
+                    root_cause=s.get("root_cause", ""),
+                    improvement_hypothesis=s.get("improvement_hypothesis", ""),
+                    evidence_quote=s.get("evidence_quote", ""),
                 )
             written = len(suggestions)
             logger.info("Trainer: збережено %d пропозицій у Neon", written)
