@@ -34,10 +34,10 @@ async def handle_message(
     source: str,
     name: str,
     sales_agent,
-) -> str:
+) -> tuple[str, bool]:
     """
     Обробляє вхідне DM від Sendrules.
-    Повертає reply рядок для відправки назад клієнту.
+    Повертає (reply, needs_human).
     """
     from agents.sales.memory import should_update_summary, update_summary
     client_id = sales_agent.client_id
@@ -70,4 +70,4 @@ async def handle_message(
     logger.info("[%s] %s conf=%.2f needs_human=%s", source, name, result.confidence, result.needs_human)
     if await should_update_summary(client_id, user_id, source):
         asyncio.create_task(update_summary(client_id, user_id, source))
-    return result.content
+    return result.content, result.needs_human

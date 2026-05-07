@@ -118,20 +118,24 @@ async def _ig_notify_managers(
 ) -> None:
     """Надсилає обом менеджерам нотифікацію про ескалацію з Instagram."""
     if not _tg_bot:
+        logger.warning("_ig_notify_managers: _tg_bot is None, нотифікацію не надіслано")
         return
+    import html as _html
+    esc = _html.escape
     phone_str = phone if phone else "не залишив"
     clean_reply = agent_reply.replace("[NOTIFY_MANAGER]", "").replace("[LOW_CONFIDENCE]", "").strip()
     text = (
-        f"📲 *Instagram — клієнт потребує зв'язку*\n\n"
-        f"👤 Ім'я: {user_name}\n"
-        f"🆔 Instagram ID: `{user_id}`\n"
-        f"📞 Телефон: {phone_str}\n\n"
-        f"*Останнє повідомлення клієнта:*\n{last_message}\n\n"
-        f"*Відповідь бота:*\n{clean_reply}"
+        f"📲 <b>Instagram — клієнт потребує зв'язку</b>\n\n"
+        f"👤 Ім'я: {esc(user_name)}\n"
+        f"🆔 Instagram ID: <code>{esc(user_id)}</code>\n"
+        f"📞 Телефон: {esc(phone_str)}\n\n"
+        f"<b>Останнє повідомлення клієнта:</b>\n{esc(last_message)}\n\n"
+        f"<b>Відповідь бота:</b>\n{esc(clean_reply)}"
     )
     for tg_id in IG_NOTIFY_IDS:
         try:
-            await _tg_bot.send_message(chat_id=tg_id, text=text, parse_mode="Markdown")
+            await _tg_bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML")
+            logger.info("IG нотифікація надіслана менеджеру %s (клієнт: %s, тел: %s)", tg_id, user_name, phone_str)
         except Exception as e:
             logger.error("Помилка нотифікації менеджера %s: %s", tg_id, e)
 
@@ -797,8 +801,8 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
             if not message:
                 return web.json_response({"reply": ""})
             phone = extract_phone(message)
-            reply = await ig_handle_message(user_id, message, source, name, sales_agent)
-            if "[NOTIFY_MANAGER]" in reply or _ig_client_wants_action(message):
+            reply, needs_human = await ig_handle_message(user_id, message, source, name, sales_agent)
+            if needs_human or _ig_client_wants_action(message):
                 asyncio.create_task(_ig_notify_managers(name, user_id, phone, message, reply))
     except Exception as e:
         logger.error("Instagram handle error: %s", e)
