@@ -50,6 +50,31 @@ brain_archive = (
 MANAGER_TELEGRAM_ID = os.getenv("MANAGER_TELEGRAM_ID")
 ARCHIVE_CHANNEL_ID = os.getenv("ARCHIVE_CHANNEL_ID", "")
 
+# ID для Instagram-нотифікацій (два менеджери)
+IG_NOTIFY_IDS = [1074363255, 348617267]
+
+# Глобальна референція на Telegram бот (для відправки з aiohttp хендлера)
+_tg_bot = None
+
+# Тригерні слова в повідомленні клієнта → нотифікація менеджерам
+_IG_PURCHASE_TRIGGERS = (
+    "замір", "замовит", "замовлення", "оформит", "оформлення",
+    "приїхати", "приїду", "приїдемо", "шоурум", "шоу-рум", "шоу рум",
+    "купити", "куплю", "договір", "підписат", "контракт",
+    "хочу поставити", "хочу встановити", "готов замовл", "готова замовл",
+    "готовий замовл",
+)
+
+
+def _ig_client_wants_action(message: str) -> bool:
+    """True якщо клієнт залишив номер телефону або написав тригерне слово покупки."""
+    if not message:
+        return False
+    if extract_phone(message):
+        return True
+    low = message.lower()
+    return any(t in low for t in _IG_PURCHASE_TRIGGERS)
+
 TG_HISTORY_LIMIT = 8
 
 
@@ -60,7 +85,7 @@ async def _notify_manager(
     agent_reply: str,
     history: list[dict],
 ) -> None:
-    """Надсилає менеджеру резюме розмови при ескалації."""
+    """Надсилає менеджеру резюме розмови при ескалації (Telegram-потік)."""
     if not MANAGER_TELEGRAM_ID:
         return
     try:
@@ -82,6 +107,33 @@ async def _notify_manager(
         )
     except Exception as e:
         logger.error(f"Помилка надсилання менеджеру: {e}")
+
+
+async def _ig_notify_managers(
+    user_name: str,
+    user_id: str,
+    phone: str | None,
+    last_message: str,
+    agent_reply: str,
+) -> None:
+    """Надсилає обом менеджерам нотифікацію про ескалацію з Instagram."""
+    if not _tg_bot:
+        return
+    phone_str = phone if phone else "не залишив"
+    clean_reply = agent_reply.replace("[NOTIFY_MANAGER]", "").replace("[LOW_CONFIDENCE]", "").strip()
+    text = (
+        f"📲 *Instagram — клієнт потребує зв'язку*\n\n"
+        f"👤 Ім'я: {user_name}\n"
+        f"🆔 Instagram ID: `{user_id}`\n"
+        f"📞 Телефон: {phone_str}\n\n"
+        f"*Останнє повідомлення клієнта:*\n{last_message}\n\n"
+        f"*Відповідь бота:*\n{clean_reply}"
+    )
+    for tg_id in IG_NOTIFY_IDS:
+        try:
+            await _tg_bot.send_message(chat_id=tg_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error("Помилка нотифікації менеджера %s: %s", tg_id, e)
 
 
 _HEAVY_KEYWORDS = (
@@ -728,25 +780,32 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
                 label = "[photo]"
             ctx_msg = f"{label} {message}".strip() if message else label
             needs_human = "[NOTIFY_MANAGER]" in reply
+            phone = extract_phone(message) if message else None
             await db.save_message(sales_agent.client_id, user_id, source, "user", ctx_msg)
             await db.update_client_profile(
                 sales_agent.client_id, user_id, source,
                 name=name if name and name != "Клієнт" else None,
-                phone=extract_phone(message) if message else None,
+                phone=phone,
             )
             await db.save_message(
                 sales_agent.client_id, user_id, source, "assistant", reply,
                 meta={"confidence": 0.9, "needs_human": needs_human, "model_used": "claude-sonnet-4-6", "cost_usd": 0.0},
             )
+            if needs_human or _ig_client_wants_action(message):
+                asyncio.create_task(_ig_notify_managers(name, user_id, phone, ctx_msg, reply))
         else:
             if not message:
                 return web.json_response({"reply": ""})
+            phone = extract_phone(message)
             reply = await ig_handle_message(user_id, message, source, name, sales_agent)
+            if "[NOTIFY_MANAGER]" in reply or _ig_client_wants_action(message):
+                asyncio.create_task(_ig_notify_managers(name, user_id, phone, message, reply))
     except Exception as e:
         logger.error("Instagram handle error: %s", e)
         return web.json_response({"reply": "Вибачте, виникла помилка. Спробуйте ще раз."})
 
-    return web.json_response({"reply": reply})
+    clean_reply = reply.replace("[NOTIFY_MANAGER]", "").replace("[LOW_CONFIDENCE]", "").strip()
+    return web.json_response({"reply": clean_reply})
 
 
 async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
@@ -915,7 +974,9 @@ async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _build_tg_app(token: str):
+    global _tg_bot
     tg_app = ApplicationBuilder().token(token).build()
+    _tg_bot = tg_app.bot
     from datetime import time as dt_time
     tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0))
     # Daily orchestrator trainer: 08:00 Kyiv = 05:00 UTC
