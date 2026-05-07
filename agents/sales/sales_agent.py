@@ -18,8 +18,13 @@ SIMPLE_KEYWORDS = [
 
 
 def _is_simple_message(text: str) -> bool:
-    """Haiku для коротких/простих повідомлень, Sonnet для складних."""
+    """Haiku для коротких/простих повідомлень, Sonnet для складних.
+    Повідомлення з цифрами — завжди Sonnet (розміри, ціни, розрахунки).
+    """
     text_lower = text.lower().strip()
+    # Є цифри → клієнт дає розміри або цифрові дані → Sonnet для точного розрахунку
+    if any(ch.isdigit() for ch in text_lower):
+        return False
     if len(text_lower) < 30:
         return True
     return any(kw in text_lower for kw in SIMPLE_KEYWORDS)
