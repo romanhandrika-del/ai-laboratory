@@ -362,13 +362,15 @@ async def get_dialogs_review(
     client_id: str,
     limit: int = 30,
     only_low: bool = False,
+    source: str = "instagram",
 ) -> list[dict]:
     """Пари user/assistant з meta для Trainer і /review."""
     pool = _get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT messages FROM dialogs WHERE client_id=$1 ORDER BY updated_at DESC",
+            "SELECT messages FROM dialogs WHERE client_id=$1 AND source=$2 ORDER BY updated_at DESC",
             client_id,
+            source,
         )
     pairs: list[dict] = []
     for row in rows:
