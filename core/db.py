@@ -165,8 +165,10 @@ CREATE TABLE IF NOT EXISTS prompts (
     current_version_id INT,
     updated_at         TIMESTAMPTZ DEFAULT NOW()
 );
-ALTER TABLE prompts ADD COLUMN IF NOT EXISTS agent_id    TEXT;
-ALTER TABLE prompts ADD COLUMN IF NOT EXISTS prompt_text TEXT;
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS agent_id          TEXT;
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS prompt_text       TEXT;
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS current_version_id INT;
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS updated_at        TIMESTAMPTZ DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS pending_reviews (
     id         SERIAL PRIMARY KEY,
