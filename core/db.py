@@ -148,40 +148,39 @@ CREATE TABLE IF NOT EXISTS orchestrator_pending_review (
 CREATE TABLE IF NOT EXISTS prompt_versions (
     id          SERIAL PRIMARY KEY,
     client_id   VARCHAR(50) NOT NULL,
-    agent_id    VARCHAR(50) NOT NULL,
-    version_num INT         NOT NULL,
     prompt_text TEXT        NOT NULL,
-    applied_by  TEXT        DEFAULT 'system',
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS agent_id    TEXT;
+ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS version_num INT;
+ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS applied_by  TEXT DEFAULT 'system';
 CREATE INDEX IF NOT EXISTS idx_prompt_versions_ca
     ON prompt_versions(client_id, agent_id, version_num DESC);
 
 CREATE TABLE IF NOT EXISTS prompts (
     id                 SERIAL PRIMARY KEY,
     client_id          VARCHAR(50) NOT NULL,
-    agent_id           VARCHAR(50) NOT NULL,
-    prompt_text        TEXT        NOT NULL,
     current_version_id INT,
-    updated_at         TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(client_id, agent_id)
+    updated_at         TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS agent_id    TEXT;
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS prompt_text TEXT;
 
 CREATE TABLE IF NOT EXISTS pending_reviews (
-    id                  SERIAL PRIMARY KEY,
-    client_id           VARCHAR(50) NOT NULL,
-    agent_id            VARCHAR(50) NOT NULL DEFAULT 'sales_instagram',
-    section_id          VARCHAR(100),
-    old_text            TEXT,
-    new_text            TEXT        NOT NULL,
-    reason              TEXT,
-    based_on_version_id INT,
-    status              VARCHAR(20) DEFAULT 'pending',
-    reject_category     VARCHAR(20),
-    created_at          TIMESTAMPTZ DEFAULT NOW(),
-    reviewed_at         TIMESTAMPTZ,
-    reviewed_by         TEXT
+    id         SERIAL PRIMARY KEY,
+    client_id  VARCHAR(50) NOT NULL,
+    new_text   TEXT        NOT NULL,
+    status     VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS agent_id            TEXT DEFAULT 'sales_instagram';
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS section_id          VARCHAR(100);
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS old_text            TEXT;
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS reason              TEXT;
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS based_on_version_id INT;
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS reject_category     VARCHAR(20);
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS reviewed_at         TIMESTAMPTZ;
+ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS reviewed_by         TEXT;
 CREATE INDEX IF NOT EXISTS idx_pending_reviews_cs
     ON pending_reviews(client_id, status);
 """
@@ -894,15 +893,17 @@ async def apply_prompt_patch_multi(patches: list[dict]) -> list[int]:
                 )
                 vid = v_row["id"]
                 version_ids.append(vid)
-                await conn.execute(
-                    """INSERT INTO prompts (client_id, agent_id, prompt_text, current_version_id)
-                       VALUES ($1,$2,$3,$4)
-                       ON CONFLICT (client_id, agent_id) DO UPDATE SET
-                           prompt_text        = EXCLUDED.prompt_text,
-                           current_version_id = EXCLUDED.current_version_id,
-                           updated_at         = NOW()""",
+                updated = await conn.fetchval(
+                    """UPDATE prompts SET prompt_text=$3, current_version_id=$4, updated_at=NOW()
+                       WHERE client_id=$1 AND agent_id=$2 RETURNING id""",
                     cid, aid, new_text, vid,
                 )
+                if not updated:
+                    await conn.execute(
+                        """INSERT INTO prompts (client_id, agent_id, prompt_text, current_version_id)
+                           VALUES ($1,$2,$3,$4)""",
+                        cid, aid, new_text, vid,
+                    )
                 _prompt_cache.pop(f"{cid}:{aid}", None)
     return version_ids
 
