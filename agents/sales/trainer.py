@@ -1,8 +1,8 @@
 """
-Sales Agent Trainer — аналізує реальні діалоги і зберігає пропозиції покращення в Neon.
+Sales Agent Trainer — аналізує реальні діалоги і зберігає пропозиції в Neon.
 
-Пропозиції → таблиця trainer_suggestions.
-Менеджер переглядає вручну і переносить у FAQ/промпт.
+Prompt-тип → pending_reviews (потребує approval).
+Інші типи (FAQ, Pricing, Escalation) → trainer_suggestions.
 """
 
 import json
@@ -26,6 +26,11 @@ _ANALYSIS_PROMPT = """Ти — тренер Sales Agent для компанії 
 - improvement_hypothesis: як це зміниться після правки (очікуваний ефект)
 - evidence_quote: дослівна цитата з діалогу, що підтверджує проблему (до 100 символів)
 
+Для type="Prompt" обов'язково додай поля:
+- section_id: назва XML-секції (role/communication_style/dialog_rules/calculation_rules/objection_handling/escalation_rules/forbidden_actions)
+- old_text: точний текст який треба замінити (або "" якщо це нова вставка в секцію)
+- new_text: новий текст замість old_text
+
 Відповідь ТІЛЬКИ у форматі JSON-масиву:
 [
   {
@@ -37,6 +42,19 @@ _ANALYSIS_PROMPT = """Ти — тренер Sales Agent для компанії 
     "suggestion": "Додати в FAQ: Монтаж входить у вартість, займає 1 день.",
     "improvement_hypothesis": "Клієнт отримає відповідь без ескалації до менеджера",
     "evidence_quote": "а монтаж окремо платний?"
+  },
+  {
+    "type": "Prompt",
+    "section_id": "escalation_rules",
+    "old_text": "Питання поза компетенцією",
+    "new_text": "Питання поза компетенцією або про технічну документацію",
+    "category": "missing_info",
+    "priority": "Medium",
+    "problem": "Агент не охоплює запити документації",
+    "root_cause": "Відсутнє правило в escalation_rules",
+    "suggestion": "Додати документацію до тригерів ескалації",
+    "improvement_hypothesis": "Менше LOW_CONFIDENCE при запитах документів",
+    "evidence_quote": "де взяти технічний паспорт?"
   }
 ]
 
@@ -98,24 +116,44 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
         return {"suggestions": [], "written": 0, "error": str(e)}
 
     written = 0
+    pending_count = 0
     if suggestions:
         try:
+            based_on_version_id = await db.get_prompt_current_version_id(client_id, "sales_instagram")
             for s in suggestions:
-                await db.save_trainer_suggestion(
-                    client_id=client_id,
-                    type=s.get("type", ""),
-                    priority=s.get("priority", ""),
-                    problem=s.get("problem", ""),
-                    suggestion=s.get("suggestion", ""),
-                    category=s.get("category", ""),
-                    root_cause=s.get("root_cause", ""),
-                    improvement_hypothesis=s.get("improvement_hypothesis", ""),
-                    evidence_quote=s.get("evidence_quote", ""),
-                )
+                s_type = s.get("type", "")
+                if s_type == "Prompt":
+                    section_id = s.get("section_id", "")
+                    old_text = s.get("old_text", "")
+                    new_text = s.get("new_text", "")
+                    if section_id and new_text:
+                        reason = s.get("suggestion", s.get("problem", ""))
+                        await db.save_trainer_review(
+                            client_id=client_id,
+                            agent_id="sales_instagram",
+                            section_id=section_id,
+                            old_text=old_text,
+                            new_text=new_text,
+                            reason=reason,
+                            based_on_version_id=based_on_version_id,
+                        )
+                        pending_count += 1
+                else:
+                    await db.save_trainer_suggestion(
+                        client_id=client_id,
+                        type=s_type,
+                        priority=s.get("priority", ""),
+                        problem=s.get("problem", ""),
+                        suggestion=s.get("suggestion", ""),
+                        category=s.get("category", ""),
+                        root_cause=s.get("root_cause", ""),
+                        improvement_hypothesis=s.get("improvement_hypothesis", ""),
+                        evidence_quote=s.get("evidence_quote", ""),
+                    )
             written = len(suggestions)
-            logger.info("Trainer: збережено %d пропозицій у Neon", written)
+            logger.info("Trainer: %d пропозицій (%d pending_reviews, %d suggestions)", written, pending_count, written - pending_count)
         except Exception as e:
             logger.error("Trainer DB error: %s", e)
             return {"suggestions": suggestions, "written": 0, "error": str(e)}
 
-    return {"suggestions": suggestions, "written": written, "error": None}
+    return {"suggestions": suggestions, "written": written, "pending_count": pending_count, "error": None}

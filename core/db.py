@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -143,6 +144,46 @@ CREATE TABLE IF NOT EXISTS orchestrator_pending_review (
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(client_id)
 );
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id          SERIAL PRIMARY KEY,
+    client_id   VARCHAR(50) NOT NULL,
+    agent_id    VARCHAR(50) NOT NULL,
+    version_num INT         NOT NULL,
+    prompt_text TEXT        NOT NULL,
+    applied_by  TEXT        DEFAULT 'system',
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_ca
+    ON prompt_versions(client_id, agent_id, version_num DESC);
+
+CREATE TABLE IF NOT EXISTS prompts (
+    id                 SERIAL PRIMARY KEY,
+    client_id          VARCHAR(50) NOT NULL,
+    agent_id           VARCHAR(50) NOT NULL,
+    prompt_text        TEXT        NOT NULL,
+    current_version_id INT,
+    updated_at         TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(client_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS pending_reviews (
+    id                  SERIAL PRIMARY KEY,
+    client_id           VARCHAR(50) NOT NULL,
+    agent_id            VARCHAR(50) NOT NULL DEFAULT 'sales_instagram',
+    section_id          VARCHAR(100),
+    old_text            TEXT,
+    new_text            TEXT        NOT NULL,
+    reason              TEXT,
+    based_on_version_id INT,
+    status              VARCHAR(20) DEFAULT 'pending',
+    reject_category     VARCHAR(20),
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    reviewed_at         TIMESTAMPTZ,
+    reviewed_by         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_reviews_cs
+    ON pending_reviews(client_id, status);
 """
 
 
@@ -781,3 +822,145 @@ async def get_recent_analyses(client_id: str, limit: int = 10) -> list[dict]:
             client_id, limit,
         )
     return [dict(r) for r in rows]
+
+
+# ── Prompt versioning (Sales Trainer) ─────────────────────────────────────────
+
+_prompt_cache: dict[str, tuple[str, float]] = {}
+_PROMPT_TTL = 60.0
+
+
+async def get_current_prompt(client_id: str, agent_id: str) -> str | None:
+    """Повертає актуальний промпт з in-memory кешем TTL=60s."""
+    key = f"{client_id}:{agent_id}"
+    now = time.time()
+    if key in _prompt_cache and _prompt_cache[key][1] > now:
+        return _prompt_cache[key][0]
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT prompt_text FROM prompts WHERE client_id=$1 AND agent_id=$2",
+            client_id, agent_id,
+        )
+    if row is None:
+        return None
+    text = row["prompt_text"]
+    _prompt_cache[key] = (text, now + _PROMPT_TTL)
+    return text
+
+
+async def get_prompt_current_version_id(client_id: str, agent_id: str) -> int | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT current_version_id FROM prompts WHERE client_id=$1 AND agent_id=$2",
+            client_id, agent_id,
+        )
+    return row["current_version_id"] if row else None
+
+
+async def get_prompt_version_text(version_id: int) -> str | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT prompt_text FROM prompt_versions WHERE id=$1",
+            version_id,
+        )
+    return row["prompt_text"] if row else None
+
+
+async def apply_prompt_patch_multi(patches: list[dict]) -> list[int]:
+    """Атомарно патчить кілька (client_id, agent_id). Повертає список нових version_id."""
+    pool = _get_pool()
+    version_ids: list[int] = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for p in patches:
+                cid = p["client_id"]
+                aid = p["agent_id"]
+                new_text = p["new_text"]
+                applied_by = p.get("applied_by", "system")
+                row = await conn.fetchrow(
+                    "SELECT COALESCE(MAX(version_num), 0) AS max_v "
+                    "FROM prompt_versions WHERE client_id=$1 AND agent_id=$2",
+                    cid, aid,
+                )
+                new_ver = row["max_v"] + 1
+                v_row = await conn.fetchrow(
+                    """INSERT INTO prompt_versions
+                         (client_id, agent_id, version_num, prompt_text, applied_by)
+                       VALUES ($1,$2,$3,$4,$5) RETURNING id""",
+                    cid, aid, new_ver, new_text, applied_by,
+                )
+                vid = v_row["id"]
+                version_ids.append(vid)
+                await conn.execute(
+                    """INSERT INTO prompts (client_id, agent_id, prompt_text, current_version_id)
+                       VALUES ($1,$2,$3,$4)
+                       ON CONFLICT (client_id, agent_id) DO UPDATE SET
+                           prompt_text        = EXCLUDED.prompt_text,
+                           current_version_id = EXCLUDED.current_version_id,
+                           updated_at         = NOW()""",
+                    cid, aid, new_text, vid,
+                )
+                _prompt_cache.pop(f"{cid}:{aid}", None)
+    return version_ids
+
+
+async def save_trainer_review(
+    client_id: str,
+    agent_id: str,
+    section_id: str,
+    old_text: str,
+    new_text: str,
+    reason: str,
+    based_on_version_id: int | None,
+) -> int:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO pending_reviews
+                 (client_id, agent_id, section_id, old_text, new_text, reason, based_on_version_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+            client_id, agent_id, section_id, old_text, new_text, reason, based_on_version_id,
+        )
+    return row["id"]
+
+
+async def list_trainer_reviews(client_id: str, status: str = "pending") -> list[dict]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM pending_reviews WHERE client_id=$1 AND status=$2 ORDER BY created_at DESC",
+            client_id, status,
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_trainer_review(review_id: int) -> dict | None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM pending_reviews WHERE id=$1",
+            review_id,
+        )
+    return dict(row) if row else None
+
+
+async def update_trainer_review_status(
+    review_id: int,
+    status: str,
+    reject_category: str | None = None,
+    reviewed_by: str = "manager",
+) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE pending_reviews
+               SET status=$2,
+                   reject_category = COALESCE($3, reject_category),
+                   reviewed_at     = NOW(),
+                   reviewed_by     = $4
+               WHERE id=$1""",
+            review_id, status, reject_category, reviewed_by,
+        )

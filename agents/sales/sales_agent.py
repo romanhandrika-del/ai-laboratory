@@ -1,14 +1,16 @@
 import os
 from pathlib import Path
-from core.base_agent import BaseAgent, MODEL_HAIKU, MODEL_SONNET
+from core.base_agent import BaseAgent, MODEL_HAIKU, MODEL_SONNET, PROMPT_INJECTION_GUARD
 from core.message import AgentMessage, AgentResult
 from core.logger import get_logger
 from agents.sales.knowledge_base import load_kb
+from core import db
 
 logger = get_logger(__name__)
 
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompt_template.md"
 PROMPT_VERSION = "v1.0.0"
+_IG_AGENT_ID = "sales_instagram"
 
 SIMPLE_KEYWORDS = [
     "привіт", "hello", "добрий", "hi", "вітаю",
@@ -93,6 +95,21 @@ class SalesAgent(BaseAgent):
         self._kb_cache = None
         self._load_kb()
         logger.info(f"[{self.client_id}] KB перезавантажена")
+
+    async def reload_prompt_from_db(self) -> bool:
+        """Завантажує актуальний промпт з Neon і оновлює self.system_prompt. Повертає True якщо оновлено."""
+        raw = await db.get_current_prompt(self.client_id, _IG_AGENT_ID)
+        if raw is None:
+            return False
+        kb_data = self._load_kb()
+        new_prompt = (
+            raw
+            .replace("{{CLIENT_NAME}}", self.client_name)
+            .replace("{{KB_DATA}}", kb_data)
+        )
+        self.system_prompt = new_prompt + "\n\n" + PROMPT_INJECTION_GUARD
+        logger.info("[%s] system_prompt оновлено з DB (%s/%s)", self.client_id, self.client_id, _IG_AGENT_ID)
+        return True
 
     def run(self, message: AgentMessage) -> AgentResult:
         summary = (message.metadata or {}).get("client_memory")

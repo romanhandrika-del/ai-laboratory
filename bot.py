@@ -9,9 +9,10 @@ import os
 import logging
 from dotenv import load_dotenv
 from aiohttp import web
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     CommandHandler,
@@ -941,6 +942,183 @@ async def handle_mark_suggestion(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"⚠️ Пропозицію #{suggestion_id} не знайдено.")
 
 
+def _review_card(r: dict, idx: int, total: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Будує текст картки + inline-кнопки для pending_review."""
+    import html as _html
+    esc = _html.escape
+    prio_icons = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+    section = esc(r.get("section_id") or "—")
+    old_t = esc((r.get("old_text") or "")[:200])
+    new_t = esc((r.get("new_text") or "")[:300])
+    reason = esc((r.get("reason") or "")[:200])
+    text = (
+        f"🧠 <b>Патч #{r['id']}</b>  [{idx}/{total}]\n"
+        f"<b>Секція:</b> <code>{section}</code>\n\n"
+        f"<b>Замінити:</b>\n<code>{old_t or '(порожньо — вставка)'}</code>\n\n"
+        f"<b>На:</b>\n<code>{new_t}</code>\n\n"
+        f"<b>Причина:</b> {reason}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{r['id']}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject:{r['id']}"),
+    ]])
+    return text, kb
+
+
+async def handle_list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list_pending — список pending_reviews для Sales Agent."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    reviews = await db.list_trainer_reviews(sales_agent.client_id, status="pending")
+    if not reviews:
+        await update.message.reply_text("✅ Немає нових патчів для перегляду.")
+        return
+    await update.message.reply_text(
+        f"📋 <b>{len(reviews)} патчів очікують підтвердження</b>\n"
+        f"Використовуй /show_review &lt;id&gt; або нижченаведені картки.",
+        parse_mode="HTML",
+    )
+    for i, r in enumerate(reviews[:5], 1):
+        text, kb = _review_card(r, i, len(reviews))
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_show_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/show_review <id> — детальна картка одного патчу."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Використання: /show_review <id>")
+        return
+    try:
+        review_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+        return
+    r = await db.get_trainer_review(review_id)
+    if not r:
+        await update.message.reply_text(f"Патч #{review_id} не знайдено.")
+        return
+    text, kb = _review_card(r, 1, 1)
+    if r["status"] != "pending":
+        await update.message.reply_text(f"{text}\n\n<i>Статус: {r['status']}</i>", parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/approve <id> — застосовує патч."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Використання: /approve <id>")
+        return
+    try:
+        review_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+        return
+    msg = await update.message.reply_text(f"⏳ Застосовую патч #{review_id}...")
+    from agents.sales.patcher import apply_patch
+    result = await apply_patch(review_id, applied_by="manager_cmd")
+    if result["ok"]:
+        await sales_agent.reload_prompt_from_db()
+        await msg.edit_text(f"✅ Патч #{review_id} застосовано. Версії: {result.get('version_ids')}")
+    else:
+        await msg.edit_text(f"⚠️ Патч #{review_id}: {result['status']} — {result['reason']}")
+
+
+async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reject <id> [category] — відхиляє патч."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Використання: /reject <id> [irrelevant|duplicate|unsafe|wrong_section|other]")
+        return
+    try:
+        review_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+        return
+    category = args[1] if len(args) > 1 else "other"
+    from agents.sales.patcher import reject_patch
+    ok = await reject_patch(review_id, category=category, reviewed_by="manager_cmd")
+    if ok:
+        await update.message.reply_text(f"❌ Патч #{review_id} відхилено ({category}).")
+    else:
+        await update.message.reply_text(f"⚠️ Патч #{review_id} не знайдено або вже оброблено.")
+
+
+async def handle_rollback_sales(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rollback_sales <version_id> — відкочує sales_instagram до вказаної версії."""
+    if str(update.effective_chat.id) != MANAGER_TELEGRAM_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Використання: /rollback_sales <version_id>")
+        return
+    try:
+        version_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("version_id має бути числом.")
+        return
+    from agents.sales.patcher import rollback_to_version
+    result = await rollback_to_version(
+        client_id=sales_agent.client_id,
+        agent_id="sales_instagram",
+        version_id=version_id,
+        applied_by="manager_rollback",
+    )
+    if result["ok"]:
+        await sales_agent.reload_prompt_from_db()
+        await update.message.reply_text(f"↩️ Sales промпт відкочено до версії {version_id} (нова версія #{result['new_version_id']}).")
+    else:
+        await update.message.reply_text(f"⚠️ Не вдалося: {result['reason']}")
+
+
+async def handle_sales_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробляє inline-кнопки approve:/reject: від карток патчів."""
+    query = update.callback_query
+    if str(query.from_user.id) != MANAGER_TELEGRAM_ID:
+        await query.answer("Недостатньо прав.")
+        return
+    await query.answer()
+    data = query.data or ""
+    if ":" not in data:
+        return
+    action, raw_id = data.split(":", 1)
+    try:
+        review_id = int(raw_id)
+    except ValueError:
+        return
+
+    if action == "approve":
+        await query.edit_message_text(f"⏳ Застосовую патч #{review_id}...", parse_mode="HTML")
+        from agents.sales.patcher import apply_patch
+        result = await apply_patch(review_id, applied_by="manager_inline")
+        if result["ok"]:
+            await sales_agent.reload_prompt_from_db()
+            await query.edit_message_text(
+                f"✅ Патч #{review_id} застосовано.\nВерсії: {result.get('version_ids')}",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"⚠️ Патч #{review_id}: {result['status']} — {result['reason']}",
+                parse_mode="HTML",
+            )
+    elif action == "reject":
+        from agents.sales.patcher import reject_patch
+        ok = await reject_patch(review_id, category="other", reviewed_by="manager_inline")
+        if ok:
+            await query.edit_message_text(f"❌ Патч #{review_id} відхилено.", parse_mode="HTML")
+        else:
+            await query.edit_message_text(f"⚠️ Патч #{review_id} не знайдено або вже оброблено.", parse_mode="HTML")
+
+
 async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Автоматичний запуск тренування щодня о 9:00 Київ (06:00 UTC)."""
     if not MANAGER_TELEGRAM_ID:
@@ -956,23 +1134,36 @@ async def scheduled_train(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         suggestions = result.get("suggestions", [])
         written = result.get("written", 0)
+        pending_count = result.get("pending_count", 0)
         if not suggestions:
             return
+        non_prompt = [s for s in suggestions if s.get("type") != "Prompt"]
         lines = [f"🧠 <b>Авто-тренування завершено</b>\nЗаписано: {written} пропозицій\n"]
-        for s in suggestions[:5]:
+        for s in non_prompt[:5]:
             prio = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(s.get("priority", ""), "⚪")
             lines.append(
                 f"{prio} <b>{s.get('type', '')} — {s.get('priority', '')}</b>\n"
                 f"{s.get('suggestion', '')}\n"
             )
-        if len(suggestions) > 5:
-            lines.append(f"<i>...ще {len(suggestions) - 5} пропозицій у Sheets</i>")
+        if len(non_prompt) > 5:
+            lines.append(f"<i>...ще {len(non_prompt) - 5} пропозицій</i>")
         await context.bot.send_message(
             chat_id=MANAGER_TELEGRAM_ID,
             text="\n".join(lines),
             parse_mode="HTML",
         )
-        logger.info("Авто-тренування завершено: %d пропозицій", len(suggestions))
+        # Фаза 2.2 — надсилаємо картки з inline-кнопками для Prompt-патчів
+        if pending_count > 0:
+            pending_reviews = await db.list_trainer_reviews(sales_agent.client_id, status="pending")
+            for i, r in enumerate(pending_reviews[:5], 1):
+                text, kb = _review_card(r, i, len(pending_reviews))
+                await context.bot.send_message(
+                    chat_id=MANAGER_TELEGRAM_ID,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+        logger.info("Авто-тренування завершено: %d пропозицій (%d pending)", written, pending_count)
     except Exception as e:
         logger.error("scheduled_train error: %s", e)
 
@@ -1000,6 +1191,12 @@ def _build_tg_app(token: str):
     tg_app.add_handler(CommandHandler("ack", handle_ack))
     tg_app.add_handler(CommandHandler("list_suggestions", handle_list_suggestions))
     tg_app.add_handler(CommandHandler("mark_suggestion", handle_mark_suggestion))
+    tg_app.add_handler(CommandHandler("list_pending", handle_list_pending))
+    tg_app.add_handler(CommandHandler("show_review", handle_show_review))
+    tg_app.add_handler(CommandHandler("approve", handle_approve))
+    tg_app.add_handler(CommandHandler("reject", handle_reject))
+    tg_app.add_handler(CommandHandler("rollback_sales", handle_rollback_sales))
+    tg_app.add_handler(CallbackQueryHandler(handle_sales_callback, pattern=r"^(approve|reject):\d+$"))
     tg_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Фото або документ з caption /analyze → Multimodal Analyst
     tg_app.add_handler(MessageHandler(
