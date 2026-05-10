@@ -169,6 +169,7 @@ ALTER TABLE prompts ADD COLUMN IF NOT EXISTS agent_id          TEXT;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS prompt_text       TEXT;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS current_version_id INT;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS updated_at        TIMESTAMPTZ DEFAULT NOW();
+DO $$ BEGIN ALTER TABLE prompts ALTER COLUMN agent_type DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
 
 CREATE TABLE IF NOT EXISTS pending_reviews (
     id         SERIAL PRIMARY KEY,
@@ -178,6 +179,9 @@ CREATE TABLE IF NOT EXISTS pending_reviews (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS agent_id            TEXT DEFAULT 'sales_instagram';
+DO $$ BEGIN ALTER TABLE pending_reviews ALTER COLUMN agent_type  DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
+DO $$ BEGIN ALTER TABLE pending_reviews ALTER COLUMN section_id  DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
+DO $$ BEGIN ALTER TABLE pending_reviews ALTER COLUMN old_text    DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
 ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS section_id          VARCHAR(100);
 ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS old_text            TEXT;
 ALTER TABLE pending_reviews ADD COLUMN IF NOT EXISTS reason              TEXT;
