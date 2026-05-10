@@ -103,7 +103,7 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
     try:
         response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2048,
+            max_tokens=4096,
             system=_ANALYSIS_PROMPT,
             messages=[{"role": "user", "content": f"Проаналізуй ці діалоги:\n\n{dialogs_text}"}],
         )

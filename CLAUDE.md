@@ -115,3 +115,27 @@ railway run python -c "import asyncio; from core import db; asyncio.run(db.check
 
 ## Фіналізація сесії
 `.claude/commands/finalize.md` — аналізує розмову і дописує нові записи до `BUGS_AND_DECISIONS.md`.
+
+## Граблі Sales Trainer — запобіжники (2026-05-08)
+
+### Trainer аналізував чужі агенти (БАГ 8)
+`get_dialogs_review` брав всі `dialogs` включно з `source='telegram'` від website_fix/youtube агентів → suggestions про деплой/DNS/SEO замість sales помилок.
+**Правило:** `get_dialogs_review(client_id, source='instagram')` — завжди передавати source. Sales trainer = тільки instagram. `core/db.py:361`.
+
+### Sales промпт живе в ДВОХ місцях одночасно
+Instagram читає з Neon DB (`db.save_agent_prompt`). Telegram читає з файлу (`agents/sales/prompt_template.md`).
+**Правило:** Будь-яка зміна поведінки sales агента → одночасно обидва файли + `db.save_agent_prompt`. Ніколи не правити тільки один.
+
+### LLM вигадує бізнес-параметри яких немає в промпті
+Термін виготовлення не був в промпті → LLM написав "7-14 днів" (реально 8-10 тижнів).
+**Правило:** Терміни, гарантії, географія, ціни — все явно в промпті. Без інструкції LLM вигадає "розумний" дефолт який може бути хибним.
+
+## Граблі Memory vs Local State — запобіжники (2026-05-10)
+
+### Memory описує remote-стан що не збігається з локальним репо
+Сесія записала «Фаза 2.1 завершена, commit a14938f» — коміт був на GitHub (паралельна сесія з іншою DB-схемою), але не локально і файли були відсутні. Результат: повна перереалізація + force push + 6 hotfix-комітів через конфлікт схем у Railway Postgres.
+**Правило:** На початку сесії де memory каже «✅ завершено» — СПОЧАТКУ:
+1. `git log --oneline | grep <hash>` — коміт є локально?
+2. `ls <ключовий файл>` — файл існує?
+3. Якщо НІ → `git pull --rebase origin main` до першого рядка коду.
+4. Якщо Railway Postgres має стару схему → `railway run python3 -c "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name='<table>'"` → ALTER TABLE ADD COLUMN / DROP NOT NULL, не CREATE TABLE з нуля.
