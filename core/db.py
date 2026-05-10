@@ -16,12 +16,18 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
+_neon_pool: asyncpg.Pool | None = None
 
 
 def _get_pool() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("db.init() не було викликано")
     return _pool
+
+
+def _get_neon_pool() -> asyncpg.Pool:
+    """Повертає пул до Neon (діалоги). Fallback до основного пулу."""
+    return _neon_pool if _neon_pool is not None else _get_pool()
 
 
 async def _setup_conn(conn: asyncpg.Connection) -> None:
@@ -195,7 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_reviews_cs
 
 
 async def init() -> None:
-    global _pool
+    global _pool, _neon_pool
     from pathlib import Path
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
@@ -206,6 +212,15 @@ async def init() -> None:
         max_size=4,
         init=_setup_conn,
     )
+    neon_url = os.getenv("NEON_DATABASE_URL")
+    if neon_url:
+        _neon_pool = await asyncpg.create_pool(
+            neon_url,
+            min_size=1,
+            max_size=2,
+            init=_setup_conn,
+        )
+        logger.info("[db] Neon пул ініціалізовано (діалоги)")
     async with _pool.acquire() as conn:
         await conn.execute(_DDL)
         # Auto-seed orchestrator.md into agent_prompts if not yet seeded
@@ -413,7 +428,7 @@ async def get_dialogs_review(
     source: str = "instagram",
 ) -> list[dict]:
     """Пари user/assistant з meta для Trainer і /review."""
-    pool = _get_pool()
+    pool = _get_neon_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT messages FROM dialogs WHERE client_id=$1 AND source=$2 ORDER BY updated_at DESC",
