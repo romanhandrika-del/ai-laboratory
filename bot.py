@@ -815,16 +815,20 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
 
 async def _ig_outgoing_receive(request: web.Request) -> web.Response:
     """POST /instagram/outgoing — вихідні повідомлення від igpulse (менеджер або бот)."""
-    secret = request.headers.get("X-Webhook-Secret")
-    if not verify_secret(secret):
-        return web.Response(status=403)
+    import json as _json
     try:
         body = await request.json()
     except Exception:
-        return web.Response(status=400)
-
-    import json as _json
-    logger.warning("IG OUTGOING RAW: %s", _json.dumps(body, ensure_ascii=False)[:1000])
+        body = {}
+    logger.warning(
+        "IG OUTGOING RAW headers=%s body=%s",
+        dict(request.headers),
+        _json.dumps(body, ensure_ascii=False)[:1000],
+    )
+    secret = request.headers.get("X-Webhook-Secret")
+    if not verify_secret(secret):
+        logger.warning("IG OUTGOING: 403 — невірний секрет: %r", secret)
+        return web.Response(status=403)
 
     sender_type = (
         body.get("sender_type")
