@@ -453,6 +453,7 @@ async def get_dialogs_review(
                 "confidence": confidence,
                 "needs_human": needs_human,
                 "created_at": u.get("ts", ""),
+                "by": meta.get("by", "bot"),
             })
         if len(pairs) >= limit:
             break

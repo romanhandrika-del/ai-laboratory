@@ -78,10 +78,11 @@ def _format_dialogs(rows: list[dict]) -> str:
             "🟡 НИЗЬКА ВПЕВНЕНІСТЬ" if r["confidence"] < 0.75 else "🟢"
         )
         ts = r["created_at"][:16].replace("T", " ")
+        responder = "[МЕНЕДЖЕР]" if r.get("by") == "manager" else "Бот:"
         lines.append(
             f"--- Діалог {i} [{flag}] {ts} ---\n"
             f"Клієнт: {r['user_msg']}\n"
-            f"Бот: {r['bot_reply']}\n"
+            f"{responder} {r['bot_reply']}\n"
         )
     return "\n".join(lines)
 

@@ -813,6 +813,44 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     return web.json_response({"reply": clean_reply})
 
 
+async def _ig_outgoing_receive(request: web.Request) -> web.Response:
+    """POST /instagram/outgoing — вихідні повідомлення від igpulse (менеджер або бот)."""
+    secret = request.headers.get("X-Webhook-Secret")
+    if not verify_secret(secret):
+        return web.Response(status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400)
+
+    import json as _json
+    logger.warning("IG OUTGOING RAW: %s", _json.dumps(body, ensure_ascii=False)[:1000])
+
+    sender_type = (
+        body.get("sender_type")
+        or body.get("type")
+        or (body.get("sender") or {}).get("type", "")
+    )
+    if sender_type in ("bot", "outgoing_bot", "automated"):
+        return web.json_response({"ok": True})
+
+    user_id = str(body.get("user_id", "")).strip()
+    message = body.get("message", "").strip()
+    if not user_id or not message:
+        return web.json_response({"ok": True})
+
+    await db.save_message(
+        sales_agent.client_id,
+        user_id,
+        "instagram",
+        "assistant",
+        message,
+        meta={"by": "manager", "confidence": 1.0, "needs_human": False},
+    )
+    logger.info("IG OUTGOING: manager reply saved for user=%s", user_id)
+    return web.json_response({"ok": True})
+
+
 async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
     """POST /webhook — вхідні оновлення від Telegram."""
     try:
@@ -827,6 +865,7 @@ async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
 async def _run_aiohttp(tg_app, port: int) -> None:
     aio_app = web.Application()
     aio_app.router.add_post("/instagram/webhook", _ig_webhook_receive)
+    aio_app.router.add_post("/instagram/outgoing", _ig_outgoing_receive)
     aio_app.router.add_post("/webhook", lambda r: _tg_webhook_receive(r, tg_app))
     runner = web.AppRunner(aio_app)
     await runner.setup()
