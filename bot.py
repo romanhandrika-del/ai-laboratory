@@ -1222,6 +1222,7 @@ def main() -> None:
         async def _start():
             await db.init()
             await db.check_connection()
+            await sales_agent.reload_prompt_from_db()
             await tg_app.initialize()
             await tg_app.start()
             await tg_app.bot.set_webhook(
@@ -1237,6 +1238,7 @@ def main() -> None:
         async def _polling_start():
             await db.init()
             await db.check_connection()
+            await sales_agent.reload_prompt_from_db()
             await tg_app.initialize()
             await tg_app.start()
             await tg_app.updater.start_polling(drop_pending_updates=True)
