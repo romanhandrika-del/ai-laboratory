@@ -813,6 +813,12 @@ async def _ig_webhook_receive(request: web.Request) -> web.Response:
     return web.json_response({"reply": clean_reply})
 
 
+async def _ig_outgoing_verify(request: web.Request) -> web.Response:
+    """GET /instagram/outgoing — верифікація ендпоінту igpulse."""
+    logger.warning("IG OUTGOING GET verify: headers=%s params=%s", dict(request.headers), dict(request.rel_url.query))
+    return web.Response(text="OK", status=200)
+
+
 async def _ig_outgoing_receive(request: web.Request) -> web.Response:
     """POST /instagram/outgoing — вихідні повідомлення від igpulse (менеджер або бот)."""
     import json as _json
@@ -869,6 +875,7 @@ async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
 async def _run_aiohttp(tg_app, port: int) -> None:
     aio_app = web.Application()
     aio_app.router.add_post("/instagram/webhook", _ig_webhook_receive)
+    aio_app.router.add_get("/instagram/outgoing", _ig_outgoing_verify)
     aio_app.router.add_post("/instagram/outgoing", _ig_outgoing_receive)
     aio_app.router.add_post("/webhook", lambda r: _tg_webhook_receive(r, tg_app))
     runner = web.AppRunner(aio_app)
