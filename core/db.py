@@ -155,6 +155,7 @@ ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS agent_id    TEXT;
 ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS version_num INT;
 ALTER TABLE prompt_versions ADD COLUMN IF NOT EXISTS applied_by  TEXT DEFAULT 'system';
 DO $$ BEGIN ALTER TABLE prompt_versions ALTER COLUMN agent_type DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
+DO $$ BEGIN ALTER TABLE prompt_versions ALTER COLUMN version_int  DROP NOT NULL; EXCEPTION WHEN undefined_column THEN NULL; END; $$;
 CREATE INDEX IF NOT EXISTS idx_prompt_versions_ca
     ON prompt_versions(client_id, agent_id, version_num DESC);
 
