@@ -6,15 +6,28 @@ Prompt-тип → pending_reviews (потребує approval).
 """
 
 import json
+from pathlib import Path
 from anthropic import AsyncAnthropic
 from core import db
 from core.logger import get_logger
 
+_PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompt_template.md"
+
 logger = get_logger(__name__)
 
-_ANALYSIS_PROMPT = """Ти — тренер Sales Agent для компанії з виробництва скляних виробів (двері, перегородки, душові).
+_ANALYSIS_PROMPT_BASE = """Ти — тренер Sales Agent для компанії з виробництва скляних виробів (двері, перегородки, душові).
 Проаналізуй НАЙГІРШІ діалоги нижче (відфільтровані за низькою впевненістю та ескалаціями).
 Дай конкретні пропозиції щодо покращення відповідей агента.
+
+⚠️ КРИТИЧНО ВАЖЛИВО:
+1. Нижче наведено ПОТОЧНИЙ ПРОМПТ агента — перед будь-якою пропозицією перевір що цього правила/тексту ще немає в промпті.
+2. НЕ пропонуй те що вже є в промпті (навіть якщо відповідь агента здається неповною).
+3. НЕ вигадуй бізнес-параметри (терміни, ціни, гарантії, типи скла) яких немає в промпті — якщо LLM їх не знає, правильна порада: додати явне правило в промпт з точними значеннями.
+4. Для type="FAQ": НЕ перераховуй опції які вже є в промпті. FAQ потрібен тільки якщо агент не може відповісти ВЗАГАЛІ (немає навіть загального правила).
+
+ПОТОЧНИЙ ПРОМПТ АГЕНТА:
+{current_prompt}
+---
 
 Для кожної пропозиції вкажи:
 - type: FAQ / Prompt / Pricing / Escalation
@@ -61,6 +74,8 @@ _ANALYSIS_PROMPT = """Ти — тренер Sales Agent для компанії 
 Якщо все добре — верни порожній масив [].
 Не вигадуй проблем якщо їх немає."""
 
+_FALLBACK_PROMPT_STUB = "(промпт недоступний — аналізуй тільки явні помилки в діалогах)"
+
 
 def _score_dialog(r: dict) -> float:
     """Чим вище — тим гірший діалог. Ескалація = +1, низька впевненість = (1 - confidence)."""
@@ -100,12 +115,19 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
 
     dialogs_text = _format_dialogs(rows)
 
+    current_prompt = await db.get_agent_prompt(client_id, "sales_instagram")
+    if not current_prompt and _PROMPT_TEMPLATE_PATH.exists():
+        current_prompt = _PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+        logger.info("Trainer: prompt loaded from file (DB empty)")
+    current_prompt = current_prompt or _FALLBACK_PROMPT_STUB
+    analysis_prompt = _ANALYSIS_PROMPT_BASE.replace("{current_prompt}", current_prompt[:6000])
+
     client = AsyncAnthropic()
     try:
         response = await client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
-            system=_ANALYSIS_PROMPT,
+            system=analysis_prompt,
             messages=[{"role": "user", "content": f"Проаналізуй ці діалоги:\n\n{dialogs_text}"}],
         )
         raw = response.content[0].text.strip()
