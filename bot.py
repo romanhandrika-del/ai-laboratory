@@ -1223,7 +1223,7 @@ def _build_tg_app(token: str):
     tg_app = ApplicationBuilder().token(token).build()
     _tg_bot = tg_app.bot
     from datetime import time as dt_time
-    tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0))
+    tg_app.job_queue.run_daily(scheduled_train, time=dt_time(hour=6, minute=0), days=(0, 2))
     # Daily orchestrator trainer: 08:00 Kyiv = 05:00 UTC
     tg_app.job_queue.run_daily(daily_trainer_job, time=dt_time(hour=5, minute=0))
     tg_app.add_handler(CommandHandler("start", handle_start))

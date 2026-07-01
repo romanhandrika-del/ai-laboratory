@@ -303,6 +303,31 @@ async def save_message(
             )
 
 
+async def upsert_dialog_messages(
+    client_id: str,
+    user_id: str,
+    source: str,
+    messages: list[dict[str, Any]],
+    client_name: str | None = None,
+) -> None:
+    """Історичний імпорт готового діалогу зі збереженими timestamps."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO dialogs (client_id, user_id, source, messages, client_name, updated_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
+               ON CONFLICT (client_id, user_id, source) DO UPDATE SET
+                   messages    = $4,
+                   client_name = COALESCE(dialogs.client_name, $5),
+                   updated_at  = NOW()""",
+            client_id,
+            user_id,
+            source,
+            messages,
+            client_name or None,
+        )
+
+
 async def load_history(
     client_id: str,
     user_id: str,
@@ -426,19 +451,27 @@ async def get_dialogs_review(
     limit: int = 30,
     only_low: bool = False,
     source: str = "instagram",
+    days_back: int | None = None,
 ) -> list[dict]:
     """Пари user/assistant з meta для Trainer і /review."""
     pool = _get_neon_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT messages FROM dialogs WHERE client_id=$1 AND source=$2 ORDER BY updated_at DESC",
-            client_id,
-            source,
-        )
+        if days_back is not None:
+            rows = await conn.fetch(
+                "SELECT messages FROM dialogs WHERE client_id=$1 AND source=$2"
+                " AND updated_at >= NOW() - ($3 || ' days')::interval ORDER BY updated_at DESC",
+                client_id, source, str(days_back),
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT messages FROM dialogs WHERE client_id=$1 AND source=$2 ORDER BY updated_at DESC",
+                client_id,
+                source,
+            )
     pairs: list[dict] = []
     for row in rows:
         msgs = list(row["messages"])
-        for i in range(0, len(msgs) - 1, 2):
+        for i in range(0, len(msgs) - 1):
             u, a = msgs[i], msgs[i + 1]
             if u.get("role") != "user" or a.get("role") != "assistant":
                 continue
@@ -940,9 +973,16 @@ async def save_trainer_review(
     new_text: str,
     reason: str,
     based_on_version_id: int | None,
-) -> int:
+) -> int | None:
     pool = _get_pool()
     async with pool.acquire() as conn:
+        existing = await conn.fetchval(
+            """SELECT id FROM pending_reviews
+               WHERE client_id=$1 AND agent_id=$2 AND section_id=$3 AND new_text=$4 AND status='pending'""",
+            client_id, agent_id, section_id, new_text,
+        )
+        if existing:
+            return None
         row = await conn.fetchrow(
             """INSERT INTO pending_reviews
                  (client_id, agent_id, section_id, old_text, new_text, reason, based_on_version_id)

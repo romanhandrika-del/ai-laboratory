@@ -107,7 +107,7 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
     Основна функція тренування.
     Повертає {"suggestions": [...], "written": N, "error": None}.
     """
-    rows = await db.get_dialogs_review(client_id, limit=limit, only_low=only_low)
+    rows = await db.get_dialogs_review(client_id, limit=limit, only_low=only_low, days_back=7)
     if not rows:
         return {"suggestions": [], "written": 0, "error": None, "msg": "Немає діалогів для аналізу."}
 
@@ -151,7 +151,7 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
                     new_text = s.get("new_text", "")
                     if section_id and new_text:
                         reason = s.get("suggestion", s.get("problem", ""))
-                        await db.save_trainer_review(
+                        review_id = await db.save_trainer_review(
                             client_id=client_id,
                             agent_id="sales_instagram",
                             section_id=section_id,
@@ -160,7 +160,8 @@ async def run_training(client_id: str, limit: int = 50, only_low: bool = False) 
                             reason=reason,
                             based_on_version_id=based_on_version_id,
                         )
-                        pending_count += 1
+                        if review_id is not None:
+                            pending_count += 1
                 else:
                     await db.save_trainer_suggestion(
                         client_id=client_id,
