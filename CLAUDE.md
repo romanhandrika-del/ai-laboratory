@@ -116,6 +116,15 @@ railway run python -c "import asyncio; from core import db; asyncio.run(db.check
 ## Фіналізація сесії
 `.claude/commands/finalize.md` — аналізує розмову і дописує нові записи до `BUGS_AND_DECISIONS.md`.
 
+## Граблі Sales Agent — розрахунок розмірів (2026-06-12)
+
+### Нестандартні підписи розмірів → LLM ігнорує множення
+Клієнт написав "2,75 виста / 3.15 длина" → агент взяв 3.15 як площу → 34 650 грн замість 86 600 грн.
+**Причина:** "виста" (неправильна Ukrainian) і "длина" (Russian) — LLM не розпізнав як два лінійних розміри.
+**Правило:** у prompt_template.md є таблиця синонімів і пряма заборона: два числа = завжди множити. Якщо знову ламається — перевіряти секцію `⛔ КРИТИЧНО — розпізнавання розмірів клієнта` у `<calculation_rules>`.
+
+---
+
 ## Граблі Sales Trainer — запобіжники (2026-05-08)
 
 ### Trainer аналізував чужі агенти (БАГ 8)
@@ -134,6 +143,18 @@ Instagram читає з Neon DB (`db.save_agent_prompt`). Telegram читає з
 Тренер пропонував FAQ "Терміни: 10-14 робочих днів" (реально 8-10 тижнів) і "Типи скла" що вже є в промпті.
 Кореневий баг: `_ANALYSIS_PROMPT` не містив поточного промпту агента → LLM не знав що вже є.
 **Правило:** `run_training` ЗАВЖДИ завантажує промпт: `db.get_agent_prompt` → fallback `prompt_template.md` → stub. Передає перші 6000 символів в системний промпт тренера. `agents/sales/trainer.py:115`.
+
+## Граблі Sales Trainer — запобіжники (2026-07-01)
+
+### Scheduled task пише дублікати в pending_reviews
+Тренер запускався щодня, аналізував ті самі 10 найгірших діалогів (без фільтру дати), і кожен день вставляв однаковий патч в `pending_reviews` голим `INSERT`.
+**Правило:** Будь-який scheduled job що пише в БД — обов'язково: `days=(0,2)` у `run_daily`, `days_back=N` у запиті діалогів, `SELECT ... WHERE status='pending'` перед INSERT. `bot.py:1226`, `db.py:save_trainer_review`.
+
+### Google Sheets KB: PermissionError з порожнім повідомленням
+`logger.error(f"... {e}")` — gspread `PermissionError()` має `str(e)==""`. Агент стартував тижнями з fallback-текстом і ніхто не помічав.
+**Правило:** У будь-якому `except Exception as e` — логувати `{e!r}` (не `{e}`). Після нового деплою Railway — перевіряти логи старту на `PermissionError`. Сервісний акаунт: `my-bot-sheets@steadfast-theme-491920-h1.iam.gserviceaccount.com` має бути Viewer на KB Sheet.
+
+---
 
 ## Граблі Memory vs Local State — запобіжники (2026-05-10)
 
