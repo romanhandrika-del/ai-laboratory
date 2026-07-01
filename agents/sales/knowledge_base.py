@@ -98,5 +98,5 @@ def load_kb(client_id: str, sheet_id: str) -> str:
         return "\n".join(sections)
 
     except Exception as e:
-        logger.error(f"[{client_id}] Помилка завантаження KB: {e}")
+        logger.error(f"[{client_id}] Помилка завантаження KB: {e!r}", exc_info=True)
         return "База знань наразі недоступна. Передавай всі нестандартні питання менеджеру."
