@@ -38,7 +38,7 @@ class WebsiteAuditAgent:
         self.chat_id = os.getenv("MANAGER_TELEGRAM_ID", "")
         init_db()
 
-    async def audit(self, url: str) -> dict:
+    async def audit(self, url: str, model: str | None = None) -> dict:
         """
         Виконує повний аудит сайту.
 
@@ -74,7 +74,8 @@ class WebsiteAuditAgent:
         }
 
         # 3. Генеруємо Claude-звіт
-        report_md, score = report_generator.generate(facts, url)
+        gen_kwargs = {"model": model} if model else {}
+        report_md, score = report_generator.generate(facts, url, **gen_kwargs)
 
         # 4. Зберігаємо звіт у файл
         report_path = _save_report(self.client_id, url, report_md)

@@ -102,13 +102,13 @@ def generate_from_brief(user_brief: str) -> tuple[str, str]:
     return _call_claude(user_msg)
 
 
-def _call_claude(user_msg: str) -> tuple[str, str]:
+def _call_claude(user_msg: str, model: str = MODEL_SONNET) -> tuple[str, str]:
     client = _get_client()
     logger.info("DesignGenerator: відправляю в Claude (~%d символів)...", len(user_msg))
 
     try:
         response = client.messages.create(
-            model=MODEL_SONNET,
+            model=model,
             max_tokens=16000,
             system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],

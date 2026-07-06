@@ -64,7 +64,7 @@ _SYSTEM_PROMPT = """\
 """
 
 
-def generate(facts: dict, url: str) -> tuple[str, int]:
+def generate(facts: dict, url: str, model: str = MODEL_SONNET) -> tuple[str, int]:
     """
     Генерує повний Markdown-звіт через Claude.
 
@@ -84,7 +84,7 @@ def generate(facts: dict, url: str) -> tuple[str, int]:
 
     try:
         response = client.messages.create(
-            model=MODEL_SONNET,
+            model=model,
             max_tokens=3000,
             system=[
                 {
