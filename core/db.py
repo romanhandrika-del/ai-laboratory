@@ -221,24 +221,27 @@ async def init() -> None:
             init=_setup_conn,
         )
         logger.info("[db] Neon пул ініціалізовано (діалоги)")
-    async with _pool.acquire() as conn:
-        await conn.execute(_DDL)
-        # Auto-seed orchestrator.md into agent_prompts if not yet seeded
-        client_id = os.getenv("DEFAULT_CLIENT_ID", "etalhome")
-        exists = await conn.fetchval(
-            "SELECT 1 FROM agent_prompts WHERE client_id=$1 AND agent_id='orchestrator' LIMIT 1",
-            client_id,
-        )
-        if not exists:
-            prompt_path = Path(__file__).parent.parent / "agents" / "orchestrator.md"
-            if prompt_path.exists():
-                prompt = prompt_path.read_text(encoding="utf-8").strip()
-                await conn.execute(
-                    "INSERT INTO agent_prompts (client_id, agent_id, prompt_text, version, updated_by) "
-                    "VALUES ($1, 'orchestrator', $2, 1, 'seed')",
-                    client_id, prompt,
-                )
-                logger.info("[db] Auto-seeded agents/orchestrator.md → agent_prompts v1")
+    if os.getenv("RUN_MIGRATIONS") == "true":
+        async with _pool.acquire() as conn:
+            await conn.execute(_DDL)
+            # Auto-seed orchestrator.md into agent_prompts if not yet seeded
+            client_id = os.getenv("DEFAULT_CLIENT_ID", "etalhome")
+            exists = await conn.fetchval(
+                "SELECT 1 FROM agent_prompts WHERE client_id=$1 AND agent_id='orchestrator' LIMIT 1",
+                client_id,
+            )
+            if not exists:
+                prompt_path = Path(__file__).parent.parent / "agents" / "orchestrator.md"
+                if prompt_path.exists():
+                    prompt = prompt_path.read_text(encoding="utf-8").strip()
+                    await conn.execute(
+                        "INSERT INTO agent_prompts (client_id, agent_id, prompt_text, version, updated_by) "
+                        "VALUES ($1, 'orchestrator', $2, 1, 'seed')",
+                        client_id, prompt,
+                    )
+                    logger.info("[db] Auto-seeded agents/orchestrator.md → agent_prompts v1")
+    else:
+        logger.info("[db] DDL/seed пропущено (RUN_MIGRATIONS не задано) — власник схеми: etalhome")
     logger.info("[db] pool ready")
 
 

@@ -69,8 +69,15 @@ Railway: `worker-production-daaa.up.railway.app` (webhook mode, `web: python bot
 Замір / приїхати / замовити → одразу `[NOTIFY_MANAGER]`.
 Ламельні вироби → тариф × 1.4.
 
+## Власник схеми БД
+Спільна Neon-база з `etalhome` (окремий репо, Telegram-бот). Owner DDL/міграцій —
+**etalhome**. `core/db.py:init()` виконує `_DDL` + auto-seed тільки якщо
+`RUN_MIGRATIONS=true` (дефолт вимкнено — звичайний деплой ai-lab схему НЕ чіпає).
+**Нове середовище:** один запуск з `RUN_MIGRATIONS=true`, далі одразу вимкнути назад.
+
 ## Environment variables
 ```
+RUN_MIGRATIONS               # "true" лише для одноразового запуску на новому середовищі
 ANTHROPIC_API_KEY
 TELEGRAM_BOT_TOKEN           # @ai_lab_roman_bot
 TELEGRAM_API_ID / API_HASH   # Telethon (локальні агенти)
