@@ -5,7 +5,6 @@ Database layer — asyncpg + Neon PostgreSQL.
 
 import asyncio
 import json
-import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -13,7 +12,9 @@ from typing import Any
 
 import asyncpg
 
-logger = logging.getLogger(__name__)
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 _pool: asyncpg.Pool | None = None
 _neon_pool: asyncpg.Pool | None = None
