@@ -81,6 +81,7 @@ Sources:
 ```
 ANTHROPIC_API_KEY
 TELEGRAM_BOT_TOKEN           # @ai_lab_roman_bot
+TELEGRAM_WEBHOOK_SECRET      # Telegram setWebhook secret_token; 32-256 chars [A-Za-z0-9_-]
 TELEGRAM_API_ID / API_HASH   # Telethon (локальні агенти)
 ARCHIVE_CHANNEL_ID           # -1003701420760
 DEFAULT_CLIENT_ID

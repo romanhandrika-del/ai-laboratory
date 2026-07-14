@@ -30,6 +30,10 @@ from agents.web_design.web_design_agent import WebDesignAgent
 from agents.multimodal_analyst.multimodal_agent import MultimodalAnalystAgent
 from agents.instagram.instagram_agent import verify_secret, handle_message as ig_handle_message
 from core.phone import extract_phone
+from core.telegram_webhook_security import (
+    is_telegram_webhook_authorized,
+    load_telegram_webhook_secret,
+)
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -861,8 +865,16 @@ async def _ig_outgoing_receive(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
+async def _tg_webhook_receive(
+    request: web.Request,
+    tg_app,
+    webhook_secret: str,
+) -> web.Response:
     """POST /webhook — вхідні оновлення від Telegram."""
+    if not is_telegram_webhook_authorized(request.headers, webhook_secret):
+        logger.warning("Telegram webhook rejected: invalid or missing secret")
+        return web.Response(status=403, text="Forbidden")
+
     try:
         data = await request.json()
         update = Update.de_json(data, tg_app.bot)
@@ -872,12 +884,15 @@ async def _tg_webhook_receive(request: web.Request, tg_app) -> web.Response:
     return web.Response(text="OK")
 
 
-async def _run_aiohttp(tg_app, port: int) -> None:
+async def _run_aiohttp(tg_app, port: int, webhook_secret: str) -> None:
     aio_app = web.Application()
     aio_app.router.add_post("/instagram/webhook", _ig_webhook_receive)
     aio_app.router.add_get("/instagram/outgoing", _ig_outgoing_verify)
     aio_app.router.add_post("/instagram/outgoing", _ig_outgoing_receive)
-    aio_app.router.add_post("/webhook", lambda r: _tg_webhook_receive(r, tg_app))
+    aio_app.router.add_post(
+        "/webhook",
+        lambda r: _tg_webhook_receive(r, tg_app, webhook_secret),
+    )
     runner = web.AppRunner(aio_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -1266,6 +1281,7 @@ def main() -> None:
     tg_app = _build_tg_app(token)
 
     if webhook_url:
+        webhook_secret = load_telegram_webhook_secret(os.environ)
         port = int(os.getenv("PORT", "8080"))
         logger.info("🤖 AI Laboratory Bot запущено (aiohttp: %s)", webhook_url)
 
@@ -1278,8 +1294,9 @@ def main() -> None:
             await tg_app.bot.set_webhook(
                 url=f"{webhook_url}/webhook",
                 drop_pending_updates=True,
+                secret_token=webhook_secret,
             )
-            await _run_aiohttp(tg_app, port)
+            await _run_aiohttp(tg_app, port, webhook_secret)
 
         asyncio.run(_start())
     else:
